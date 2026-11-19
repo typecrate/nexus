@@ -1,0 +1,30 @@
+# Rust build artifacts normally land in the repo-root .rust/target (the root
+# .cargo/config.toml sets target-dir), so nothing here is expected except when
+# someone builds with an explicit --target-dir. `.rust/` still appears in a
+# standalone checkout / moved copy: it is a local cargo home + target cache and
+# is never source.
+target/
+/rust/target/
+.rust/
+
+# No build output is expected in this package: the only shippable artifact is the
+# native binary cargo writes to the repo-root `.rust/target`.
+dist/
+
+# Artifact spill from a local `yarn start` run (NEXUS_ARTIFACT_ROOT default).
+var/
+
+# Same spill when the hub is launched from inside this package: the built-in
+# default is `Temp/nexus/artifacts`, which is relative to the working directory,
+# so running `yarn start` here would otherwise leave untracked spill in the tree.
+# It also covers the fallback of `io::test_scratch` (test-only scratch normally
+# resolves to the repo-root `Temp/nexus-tests/`, per root AGENTS.md; if this
+# package is checked out on its own, that falls back to `Temp/` in here).
+Temp/
+
+# The deploy scripts' workspace link (@services/daytona).
+node_modules/
+*.log
+
+# Turbo's per-package run logs and cache manifests.
+.turbo/

@@ -1,0 +1,12 @@
+// tsconfig.json — the TypeScript surface of this package is scripts/*.ts ONLY.
+// The Rust crates are checked by cargo (`check`/`clippy`/`test`), so neither they
+// nor any generated artifact belongs here. Extends the root config, whose
+// `exclude` already drops **/*.test.ts — so `yarn typecheck` covers the
+// production scripts and vitest owns the colocated test files.
+// Precedent: services/daytona/tsconfig.json (same shape; this package now sits
+// three levels deep, packages/typecrate/nexus, so the repo-root config is
+// ../../../tsconfig.json — the two ".." it had at services/nexus are one short).
+{
+    "extends": "../../../tsconfig.json",
+    "include": ["scripts/**/*.ts"]
+}

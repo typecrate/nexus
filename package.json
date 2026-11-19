@@ -1,0 +1,55 @@
+{
+  "name": "@typecrate/nexus",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Outbound-dial inference broker: a Rust (axum + tokio) hub that queues consumer jobs and streams results back over one persistent worker connection.",
+  "license": "MIT",
+  "type": "module",
+  "#main": "No entry point: this package publishes nothing and no other package imports it. The npm layer exists only to give the Rust workspace a verb list and the Daytona/Modal deploy scripts a runner.",
+  "files": [
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "#toolchain": "Every Rust script runs the pinned toolchain via `rustup run` when rustup is present; see README 'Verification status' for this host.",
+    "fmt": "cargo fmt --all",
+    "fmt:check": "cargo fmt --all -- --check",
+    "check": "cargo check --workspace --all-targets",
+    "clippy": "cargo clippy --workspace --all-targets -- -D warnings",
+    "test": "cargo test --workspace",
+    "test:core": "cargo test -p nexus-core",
+    "test:accept": "cargo test -p nexus-core --test acceptance",
+    "build": "cargo build --release -p nexus-server",
+    "start": "cargo run -p nexus-server --bin nexus-hub",
+    "deploy:daytona": "vite-node scripts/deploy-daytona.ts",
+    "#deploy:endpoint": "The platform-neutral verb: ONE URL argument (Daytona preview link, Modal box/sandbox URL, loopback runner), and it resolves a busy slot itself — preflight /health + /status, DELETE / if occupied, then deploy. On a Modal box the slot decides: empty = deploy as-is; busy = REPLACE the container (DELETE /sandbox, wait for the new empty one, deploy into it). scripts/deploy-endpoint.ts.",
+    "deploy:endpoint": "vite-node scripts/deploy-endpoint.ts",
+    "worker": "cargo run -p nexus-worker-example",
+    "bench": "cargo build --profile profiling -p nexus-server",
+    "#daytona": "deploy:daytona ships bytes to an ENDPOINT THAT ALREADY EXISTS; start:daytona is the orchestrator that creates the sandbox first (scripts/start-daytona.ts header). vite-node is root-hoisted, so the TS script runs with no build step.",
+    "start:daytona": "vite-node scripts/start-daytona.ts",
+    "start:modal": "vite-node scripts/start-modal.ts",
+    "#ts": "The TypeScript surface is scripts/*.ts ONLY (the Rust crates are checked by cargo, and every host script runs on the root-hoisted vite-node — no build step, no raw node). test:scripts covers the scripts; `test` stays cargo, which turbo orchestrates.",
+    "typecheck": "tsc --noEmit",
+    "test:scripts": "vitest run scripts",
+    "#test:scripts": "Covers the tsx lifecycle scripts by glob (scripts/*.test.ts): start-daytona's parser/plan/argv/modes/interrupt guard, deploy-daytona's parser, auth matrix, tar packing, plan, retry policy and poll state machine, and deploy-endpoint's cold-start/auth/dead probe table, slot policy, child argv and hub-URL reporting. Every side effect is injected — no network, no cargo, no sandbox — and counts are deliberately not restated here (drift).",
+    "verify": "yarn fmt:check && yarn clippy && yarn test && yarn build"
+  },
+  "#dependencies": "scripts/start-daytona.ts imports createSandbox from @services/daytona/sandbox, and scripts/start-modal.ts reads the Modal box URL from @config/vault; house convention is \"*\" + TS sources resolved through the workspace symlink (no build step, no lockfile entry needed for a private workspace package).",
+  "dependencies": {
+    "@config/vault": "*",
+    "@services/daytona": "*"
+  },
+  "keywords": [
+    "inference",
+    "broker",
+    "queue",
+    "rust",
+    "axum",
+    "tokio",
+    "websocket"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}

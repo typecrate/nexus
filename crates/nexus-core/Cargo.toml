@@ -1,0 +1,29 @@
+# nexus-core: the portable broker spine.
+#
+# Hard rule for this crate — it is **synchronous and IO-free**, because every
+# scheduling rule the broker has lives here and nothing else may own policy:
+#   * no tokio (no IO driver / no time driver — the runtime is nexus-server's),
+#   * no threads, no SystemTime (all clocks are injected as u64 millis),
+#   * no filesystem, no sockets,
+#   * BTreeMap/BTreeSet for anything whose order is observable (determinism).
+# These rules are what make the 89 lib tests and 52 acceptance tests reproducible
+# step-for-step. They outlive the `wasm32-unknown-unknown` leg that was removed
+# on 2026-11-14 (`crates/nexus-wasm`), which used to be their other excuse.
+[package]
+name = "nexus-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Nexus inference broker core: protocol, pool actor, queue, relay, store."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
