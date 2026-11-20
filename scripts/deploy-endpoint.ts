@@ -15,7 +15,7 @@
 //                     (cargo build + POST the bundle + poll /status)
 //
 //  IT IS PLATFORM-AGNOSTIC ON PURPOSE. The only thing it depends on is the ENDPOINT
-//  CONTRACT v1 (services/daytona/sandbox/runtime-server.mjs is its source of truth),
+//  CONTRACT v1 (services/daytona/sandbox/runtime-server is its source of truth),
 //  which every runtime this repo boots implements — a Daytona sandbox preview URL, a
 //  Modal box's `…--container-sandbox.modal.run` web-function URL, a Modal sandbox's
 //  tunnel URL, or the stdlib runner on loopback. So the URL is an ARGUMENT, not a
