@@ -1,41 +1,42 @@
 // ══════════════════════════════════════════════════════════════════════════════
-//  start-daytona.ts — ONE COMMAND THAT BOOTS A NEXUS HUB INSIDE A DAYTONA SANDBOX
-//  ("spawn a sandbox, then POST the nexus code into it once it is ready")
+//  start-daytona.ts — ONE COMMAND THAT BOOTS THE NEXUS APP INSIDE A DAYTONA SANDBOX
+//  ("spawn a sandbox, then register the nexus bundle in its app registry")
 // ══════════════════════════════════════════════════════════════════════════════
 //
 //  WHAT THIS DOES (the orchestrator the deploy script was missing):
-//    deploy-daytona.ts already speaks the sandbox runtime contract (POST bytes,
-//    poll /status), but it needs an `--endpoint` that already exists. This script
-//    supplies one:
+//    deploy-daytona.ts already speaks the sandbox runtime v2 contract (upload to
+//    POST /apps, poll GET /apps/nexus), but it needs an `--endpoint` that already
+//    exists. This script supplies one:
 //
-//        createSandbox()  ──►  spawn deploy-daytona.ts  ──►  getPreviewLink(hubPort)
-//        (fresh sandbox,      (cargo build + POST bytes      (the URL clients use
-//         runner on :7777      + poll until ready)            to reach the hub)
+//        createSandbox()  ──►  spawn deploy-daytona.ts  ──►  hubUrlFor(endpoint)
+//        (fresh sandbox,      (cargo build + POST bytes      (endpoint + /app/nexus/,
+//         runner on :7777      + poll until ready)            the URL clients use)
 //         already health-checked)
 //
 //    It never talks to Daytona or to the sandbox itself: sandbox bring-up goes
 //    through the @services/daytona/sandbox LIBRARY (createSandbox, which already
-//    waits for `GET /health`), and every byte of POST/poll/teardown is delegated
-//    to the sibling script as a CHILD PROCESS (that script runs main() at import,
-//    so importing it is not an option — spawning it is).
+//    waits for `GET /health`), and every byte of upload/poll/teardown is delegated
+//    to the sibling script as a CHILD PROCESS (that script has an entry guard, so
+//    importing it would be possible — but spawning keeps its CLI/exit-code
+//    contract the one surface this orchestrator depends on).
 //
-//  TWO DIFFERENT URLS — the distinction this script exists to make obvious:
+//  ONE ORIGIN, TWO URLS — the distinction this script exists to make obvious:
 //    · MANAGEMENT endpoint = createSandbox().endpoint = the runner's preview URL
 //      (port 7777 inside the sandbox). It is what `--endpoint` is pointed at, what
-//      deploy POSTs to, and what GET /status + GET /logs + DELETE / answer on.
-//      Auth, when the sandbox is private, is the `x-daytona-preview-token` header
-//      (deploy-daytona.ts:17-21) — the orchestrator just forwards `--token`.
-//    · HUB URL = sandbox.getPreviewLink(<hub port>) = a DIFFERENT preview link,
-//      one per port, for the nexus hub process the runner started on `--port`
-//      (default 8085). It can carry its OWN token even when the management URL
-//      does not, which is why the summary prints both, separately.
+//      deploy POSTs to, and what GET /health + GET /apps + GET /apps/nexus +
+//      DELETE /apps/nexus answer on. Auth, when the sandbox is private, is the
+//      `x-daytona-preview-token` header — the orchestrator just forwards `--token`.
+//    · HUB URL = the SAME origin + `/app/nexus/`. v2 has NO per-port preview link
+//      (§16.1 P-7/P-8): every app is a path under the one runner origin, so there
+//      is nothing to mint and no second token. `hubToken` in the summary is only
+//      the compatibility alias of that same runner-origin preview token.
 //
 //  RUN VIA (package.json scripts; `vite-node` is root-hoisted, house convention):
 //      yarn workspace @typecrate/nexus start:daytona                       # fresh sandbox + deploy, waits for ready
 //      yarn workspace @typecrate/nexus start:daytona --ttl 60 --env NEXUS_TOKEN=xyz
 //      yarn workspace @typecrate/nexus start:daytona --private             # token-authed preview URLs
 //      yarn workspace @typecrate/nexus start:daytona --endpoint https://… --token …   # REUSE an endpoint you already own
-//      yarn workspace @typecrate/nexus start:daytona --teardown --endpoint https://… # DELETE / (frees the slot, NOT the sandbox)
+//      yarn workspace @typecrate/nexus start:daytona --teardown --endpoint https://… # DELETE /apps/nexus (NOT the sandbox)
 //      yarn workspace @typecrate/nexus start:daytona --dry-run             # print the plan, touch nothing
 //    Extra args after the yarn script name are appended to the command, so every
 //    flag below works through yarn too. `--help` is the usage screen.
@@ -71,20 +72,26 @@
 //  MACHINE-READABLE OUTPUT: after a successful fresh/reuse start, the LAST line
 //  of stdout is exactly ONE single-line JSON object (nothing else is on that line;
 //  the example below is wrapped only to fit):
-//      {"mode":"fresh","endpoint":"https://…","hubUrl":"https://…",
-//       "sandboxId":"…","name":"…","public":true,"hubPort":8085}
+//      {"mode":"fresh","endpoint":"https://…","hubUrl":"https://…/app/nexus/",
+//       "sandboxId":"…","name":"…","public":true}
 //      (a PRIVATE run inserts "token":"…" and "hubToken":"…" in that same order)
-//  `token` (management preview token) and `hubToken` (hub preview token) are
-//  emitted ONLY when the sandbox is PRIVATE (needsPreviewToken). Daytona hands a
-//  token back for EVERY preview link — PortPreviewUrl.token is a required string in
-//  its API (api-client src/models/port-preview-url.d.ts:22-24) and a public sandbox
-//  gets one too — so presence proves nothing; visibility is the whole rule, exactly
-//  how @services/daytona reads it (its curlFor drops the header when public,
+//  `token` (runner-origin preview token) is emitted ONLY when the sandbox is
+//  PRIVATE (needsPreviewToken). Daytona hands a token back for EVERY preview link —
+//  PortPreviewUrl.token is a required string in its API (api-client
+//  src/models/port-preview-url.d.ts:22-24) and a public sandbox gets one too — so
+//  presence proves nothing; visibility is the whole rule, exactly how
+//  @services/daytona reads it (its curlFor drops the header when public,
 //  setup-sandbox.test.ts:606-621). On a PUBLIC sandbox (the default) both fields are
 //  absent: the hub URL is bare, and a consumer that sent the token would be sending
-//  a credential the proxy never asked for. In REUSE mode the same
-//  line carries `"hubUrl":null` (the hub preview link needs the sandbox's SDK
-//  handle, which only a fresh create has) and no `sandboxId`/`name`/`public`.
+//  a credential the proxy never asked for.
+//  `hubToken` is a COMPATIBILITY ALIAS, not a second credential: v2 mints no
+//  per-port preview link, so the hub URL lives on the same origin as the
+//  management endpoint and is authenticated by the SAME preview token. Consumers
+//  that read hubToken (services/molab's deploy script) keep working unchanged.
+//  REUSE mode emits a concrete hubUrl too (endpoint + /app/nexus/), because the
+//  app path needs no SDK handle; it carries no `sandboxId`/`name`/`public`.
+//  `hubPort` appears only when --port was explicitly typed: the internal port is
+//  auto-allocated by the runner otherwise, and it is never part of a public URL.
 //  Automation chains off `hubUrl` (client-facing) and, for a later
 //  `--teardown`/`--endpoint` run, off `endpoint` + `token`. Teardown and dry-run
 //  print no JSON line.
@@ -100,13 +107,17 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 // The curated barrel (index.ts) is the ONLY public surface of the service; it has
 // no import side effects, which is what keeps this module importable in tests.
-import { createSandbox } from '@services/daytona/sandbox';
+// The two ADMIN_*_ENV names are the shared module's own contract names (§12.3), so
+// this script never re-spells a variable the runner/api may rename.
+import { ADMIN_TOKEN_ENV, ADMIN_TOKEN_FILE_ENV, createSandbox } from '@services/daytona/sandbox';
 import type { CreateSandboxOptions, SandboxLog } from '@services/daytona/sandbox';
+// ONE origin, one app path: the hub URL is derived, never minted. See the header.
+import { APP_NAME, APP_PATH, hubUrlFor } from './sandbox-contract';
 
 // Re-exported so a consumer (or the test suite) can NAME the shapes this module's
 // plan types carry, without reaching past the daytona barrel on its own.
@@ -174,8 +185,11 @@ const findViteNodeCli = (start: string): string | undefined => {
 /** Exported so the test can name the exact argv[0] the child is spawned with. */
 export const VITE_NODE_CLI = findViteNodeCli(PACKAGE_ROOT) ?? 'vite-node';
 
-/** Hub port default — MUST equal DEFAULT_PORT in deploy-daytona.ts:70 (8085). */
-export const DEFAULT_HUB_PORT = 8085;
+/**
+ * The app's public path (v2 §4.2). Re-exported so the test suite can name the one
+ * fact the summary's hubUrl is built from without importing the helper module.
+ */
+export const HUB_PATH = APP_PATH;
 /** Every line this script itself writes is prefixed, so it is greppable next to the child's `>>>`/`✓` lines. */
 const PREFIX = '[nexus:start]';
 /**
@@ -183,6 +197,18 @@ const PREFIX = '[nexus:start]';
  * deliberately NOT a URL: dry-run never spawns, so it can never reach a fetch call.
  */
 const PLACEHOLDER_ENDPOINT = '<from createSandbox>';
+
+/**
+ * Masks the value of every `--token`/`--admin-token` pair for the dry-run print.
+ * Only the RENDERED argv changes; the spawned invocation keeps the real values.
+ */
+const redactSecretArgs = (args: readonly string[]): string[] => {
+    const out = [...args];
+    for (let i = 0; i < out.length - 1; i++) {
+        if (out[i] === '--token' || out[i] === '--admin-token') out[i + 1] = '***';
+    }
+    return out;
+};
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  USAGE
@@ -192,7 +218,9 @@ export const USAGE = `usage: yarn workspace @typecrate/nexus start:daytona [flag
      (or: npx vite-node scripts/start-daytona.ts [flags])
 
   spawns a Daytona sandbox, hands it to scripts/deploy-daytona.ts, and prints the
-  hub URL. Three modes, derived from the flags (never combined):
+  app URL. The app is registered as "${APP_NAME}" in the runner's v2 registry and
+  served at ${APP_PATH} on the ONE runner origin. Three modes, derived from the
+  flags (never combined):
     fresh     default            createSandbox → deploy → hub URL
     reuse     --endpoint <url>   deploy into an endpoint you already own
     teardown  --teardown         deploy --teardown (needs --endpoint)
@@ -212,19 +240,35 @@ export const USAGE = `usage: yarn workspace @typecrate/nexus start:daytona [flag
 
   targeting (reuse / teardown modes ONLY — a fresh run has no endpoint to target):
     --endpoint <url>  the sandbox RUNNER preview URL (management port 7777)
-    --token <t>       that endpoint's preview token, if it is private; the child
-                      sends it as the x-daytona-preview-token header. A FRESH run
-                      takes its token from createSandbox instead, so --token without
-                      --endpoint is an error.
+    --token <t>       that endpoint's PREVIEW token, if it is private; the child
+                      sends it as the x-daytona-preview-token header on every request.
+                      A FRESH run takes its token from createSandbox instead, so
+                      --token without --endpoint is an error.
+    --admin-token <t> the runner's OPTIONAL admin credential (§12.3), NOT the preview
+                      token. In FRESH mode it is applied to the new runner at boot as
+                      SANDBOX_ADMIN_TOKEN, and the deploy child sends it as
+                      Authorization: Bearer for named deploy/log operations. Set
+                      SANDBOX_ADMIN_TOKEN_FILE=<host path> instead for the preferred
+                      file form (uploaded 0600; only the path reaches the runner; the
+                      value never reaches argv or a log line). REUSE/TEARDOWN can only
+                      send the Bearer — the runner's boot-time credential cannot be
+                      changed without restarting the sandbox. Env fallbacks for the
+                      flag: NEXUS_SANDBOX_ADMIN_TOKEN, then SANDBOX_ADMIN_TOKEN.
+                      Never printed.
 
   deploy passthrough — forwarded verbatim to scripts/deploy-daytona.ts:
     --mode <m>        local (default) | remote-build
-    --port <n>        port the HUB listens on inside the sandbox (default ${DEFAULT_HUB_PORT});
-                      also the port the hub URL is minted for (getPreviewLink)
+    --port <n>        OPTIONAL internal loopback port; omitted = the runner
+                      AUTO-ALLOCATES one (v2 default). Never public: clients always
+                      use ${APP_PATH}, so there is no preview link per port.
+    --replace         PUT /apps/${APP_NAME} (blue-green) instead of POST /apps. Only
+                      legal while the app is ready or failed; the current revision
+                      keeps serving until the new one is ready.
     --env K=V         extra runtime env var; repeatable
     --no-build        ship an already-built artifact instead of running cargo
     --artifact <path> ship exactly this file (implies --no-build)
-    --no-wait         return after the deploy is accepted, without polling /status
+    --no-wait         return after the deploy is accepted, without polling
+                      GET /apps/${APP_NAME}
 
   behavior:
     --keep-on-fail    fresh mode: leave the sandbox running when the deploy fails
@@ -271,10 +315,18 @@ export type StartDaytonaFlags = {
     /** '' = not given → fresh mode. */
     endpoint: string;
     token: string;
+    /** '' = the runner has no admin auth (or the operator did not supply it). */
+    adminToken: string;
     // ── deploy passthrough ──
     mode: 'local' | 'remote-build';
-    /** The HUB's port inside the sandbox — not the runner's 7777. See buildSandboxOptions. */
-    port: number;
+    /**
+     * The APP's internal loopback port — not the runner's 7777. `undefined` is the
+     * v2 default: the runner auto-allocates (§6.2 step 4). Only an explicit --port
+     * is forwarded; it never appears in a public URL.
+     */
+    port?: number;
+    /** true = PUT /apps/nexus (blue-green); false/absent = POST /apps (create). */
+    replace: boolean;
     env: Record<string, string>;
     noBuild: boolean;
     artifact: string;
@@ -291,9 +343,10 @@ const NUMERIC_FLAGS: Record<string, { min: number; max?: number; unit: string }>
     '--cpu': { min: 1, unit: 'vCPU, >= 1' },
     '--mem': { min: 1, unit: 'GiB, >= 1' },
     '--disk': { min: 1, unit: 'GiB, >= 1' },
-    // The hub port: validated HERE so a bad value is a usage error, not a
-    // deploy-script death after a multi-minute cargo build.
-    '--port': { min: 1, max: 65535, unit: 'TCP port 1-65535' },
+    // The app port: validated HERE so a bad value is a usage error, not a
+    // deploy-script death after a multi-minute cargo build. 0 is the explicit
+    // spelling of "auto" (§8.3) and lands as `undefined` in the flags.
+    '--port': { min: 0, max: 65535, unit: 'TCP port 0-65535 (0 = auto)' },
 };
 
 /** Range check with the service's exact message shape (setup-sandbox.ts:575-579). */
@@ -321,8 +374,11 @@ export const parseArgs = (argv: readonly string[]): ParsedStartArgs => {
         public: true,
         endpoint: '',
         token: '',
+        adminToken: '',
         mode: 'local',
-        port: DEFAULT_HUB_PORT,
+        // undefined = auto-allocation; the v1 8085 default is deliberately gone.
+        port: undefined,
+        replace: false,
         env: {},
         noBuild: false,
         artifact: '',
@@ -340,7 +396,7 @@ export const parseArgs = (argv: readonly string[]): ParsedStartArgs => {
     for (let i = 0; i < argv.length; i++) {
         const flag = argv[i]!;
         // Value flags share one branch so the "needs a value" wording stays identical.
-        if (flag === '--api-key' || flag === '--ttl' || flag === '--snapshot' || flag === '--cpu' || flag === '--mem' || flag === '--disk' || flag === '--endpoint' || flag === '--token' || flag === '--mode' || flag === '--port' || flag === '--env' || flag === '--artifact') {
+        if (flag === '--api-key' || flag === '--ttl' || flag === '--snapshot' || flag === '--cpu' || flag === '--mem' || flag === '--disk' || flag === '--endpoint' || flag === '--token' || flag === '--admin-token' || flag === '--mode' || flag === '--port' || flag === '--env' || flag === '--artifact') {
             const value = argv[++i];
             if (value === undefined || value.startsWith('--')) {
                 errors.push(`${flag} needs a value`);
@@ -348,6 +404,7 @@ export const parseArgs = (argv: readonly string[]): ParsedStartArgs => {
             }
             if (flag === '--endpoint') flags.endpoint = value;
             else if (flag === '--token') flags.token = value;
+            else if (flag === '--admin-token') flags.adminToken = value;
             else if (flag === '--api-key') {
                 flags.apiKey = value;
                 given(flag);
@@ -378,7 +435,12 @@ export const parseArgs = (argv: readonly string[]): ParsedStartArgs => {
                 } else if (flag === '--disk') {
                     flags.disk = Number(value);
                     given(flag);
-                } else flags.port = Number(value);
+                } else {
+                    // --port 0 is explicit auto (§8.3): it must not reach the child
+                    // as a literal 0 in config, and `undefined` is what omits it.
+                    const port = Number(value);
+                    flags.port = port === 0 ? undefined : port;
+                }
             }
             continue;
         }
@@ -391,6 +453,7 @@ export const parseArgs = (argv: readonly string[]): ParsedStartArgs => {
         } else if (flag === '--no-build') flags.noBuild = true;
         else if (flag === '--no-wait') flags.wait = false;
         else if (flag === '--teardown') flags.teardown = true;
+        else if (flag === '--replace') flags.replace = true;
         else if (flag === '--dry-run') flags.dryRun = true;
         else if (flag === '--keep-on-fail') flags.keepOnFail = true;
         else if (flag === '-h' || flag === '--help') flags.help = true;
@@ -406,10 +469,13 @@ export const parseArgs = (argv: readonly string[]): ParsedStartArgs => {
     if (flags.mode !== 'local' && (flags.noBuild || flags.artifact)) {
         errors.push('--no-build and --artifact apply to --mode local only (remote-build ships a source tarball)');
     }
+    // --teardown and --replace are different verbs; accepting both would leave the
+    // operator guessing which one won (mirrors deploy-daytona.ts's own rule).
+    if (flags.teardown && flags.replace) errors.push('--teardown and --replace are different verbs — pick one');
     // teardown needs an endpoint: a FRESH sandbox has an empty slot, so creating one
     // only to tear it down would burn minutes and delete nothing.
     if (flags.teardown && !flags.endpoint) {
-        errors.push('--teardown needs --endpoint <url> — a fresh sandbox has an empty runtime slot, and this script never tears down a sandbox it did not create');
+        errors.push('--teardown needs --endpoint <url> — a fresh sandbox has an empty app registry, and this script never tears down a sandbox it did not create');
     }
     // Sandbox-creation knobs + --endpoint contradict each other: an endpoint already
     // names a sandbox, so there is nothing left to configure.
@@ -436,46 +502,103 @@ export const resolveMode = (flags: Pick<StartDaytonaFlags, 'teardown' | 'endpoin
 // ══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * The deploy child's nexus-specific admin env alias (deploy-daytona.ts parseArgs:
+ * `NEXUS_SANDBOX_ADMIN_TOKEN || SANDBOX_ADMIN_TOKEN`). Named here because the
+ * shared barrel exports only the generic SANDBOX_ADMIN_TOKEN name.
+ */
+export const NEXUS_ADMIN_TOKEN_ENV = 'NEXUS_SANDBOX_ADMIN_TOKEN';
+
+/**
+ * The env-form token this run would hand the runner at boot: the explicit flag,
+ * then the deploy child's nexus-specific alias, then the generic name. Empty when
+ * none is configured. Never log this value.
+ */
+export const adminTokenFrom = (flags: Pick<StartDaytonaFlags, 'adminToken'>, env: Readonly<Record<string, string | undefined>>): string =>
+    flags.adminToken || env[NEXUS_ADMIN_TOKEN_ENV] || env[ADMIN_TOKEN_ENV] || '';
+
+/** Which credential (if any) a Bearer request should carry, and where it came from. */
+export type AdminBearerSource = 'none' | 'file' | 'flag' | 'env';
+export type AdminBearer = { source: AdminBearerSource; token: string; filePath?: string };
+
+/**
+ * Resolves ONE effective admin credential for this run, in the SAME precedence the
+ * shared bring-up uses (`resolveAdminAuth`): SANDBOX_ADMIN_TOKEN_FILE first, then an
+ * explicit token, then the token env vars. Fresh mode passes this to createSandbox
+ * (so the new runner boots with it) and to the deploy child (so its named deploy and
+ * log reads carry the Bearer). Reuse/teardown can only SEND it — the runner's
+ * boot-time credential cannot be changed without restarting/rebooting the sandbox.
+ * Errors name the path only; the file's contents never appear in a message or log.
+ */
+export const resolveAdminBearer = (flags: Pick<StartDaytonaFlags, 'adminToken'>, env: Readonly<Record<string, string | undefined>>): AdminBearer => {
+    const filePath = env[ADMIN_TOKEN_FILE_ENV];
+    if (filePath) {
+        let raw: string;
+        try {
+            raw = readFileSync(filePath, 'utf8');
+        } catch (error) {
+            throw new Error(`${ADMIN_TOKEN_FILE_ENV} points at ${filePath}, which cannot be read (${error instanceof Error ? error.message : error}) — fix the path or unset it`);
+        }
+        const token = raw.trim();
+        if (!token) throw new Error(`${ADMIN_TOKEN_FILE_ENV} points at ${filePath}, which is empty — the runner requires an admin token (spec §12.3) and refuses to boot without one`);
+        return { source: 'file', token, filePath };
+    }
+    if (flags.adminToken) return { source: 'flag', token: flags.adminToken };
+    const envToken = env[NEXUS_ADMIN_TOKEN_ENV] || env[ADMIN_TOKEN_ENV];
+    if (envToken) return { source: 'env', token: envToken };
+    return { source: 'none', token: '' };
+};
+
+/**
  * Maps orchestrator flags onto createSandbox's option shape (sandbox/index.ts:8-12).
  * Only PRESENT knobs are set, so every default stays the service's own — and
  * `port` is deliberately NEVER set: createSandbox's `port` is the RUNNER's port
  * (7777, the management endpoint), while our `--port` is the HUB's port. Passing it
  * through would repoint the management endpoint at the hub and break the deploy.
  */
-export const buildSandboxOptions = (flags: StartDaytonaFlags): CreateSandboxOptions => ({
-    // '' means "not given" (the parser's absent marker) → env/vault fallback.
-    apiKey: flags.apiKey || undefined,
-    ttlMinutes: flags.ttl,
-    public: flags.public,
-    snapshot: flags.snapshot,
-    // cpu/mem stay at the CPU-class FLOOR (1 vCPU / 1 GiB) on purpose — NOT the
-    // service's 4/8/10 (setup-sandbox.ts:231, which is what a bare createSandbox would
-    // inherit through `undefined`). Measured on the deployed hub 2026-11-12: 7.7 MB RSS,
-    // ~0.25 ms CPU per request, dispatch latency 0 ms, so the smallest legal CPU class
-    // serves the hub; this org's CPU class caps at 4 vCPU / 8 GiB / 10 GiB anyway
-    // (setup-sandbox.ts:117-123). RAM stays there because Daytona enforces `memory` as a
-    // HARD limit with Memory == MemorySwap (no swap headroom) AND a larger class is the
-    // only thing that raises the bill: Daytona charges reserved class × wall-clock.
-    //
-    // DISK moved to 3 GiB (from 1) because the old comment sized it from that same
-    // 7.7 MB hub measurement, which never measured the disk at all. What actually
-    // occupies the sandbox disk is everything BESIDES the hub's RSS: the runner process
-    // beside it (measured 67.9 MB baseline, 171–228 MB after real upload churn), the
-    // staged bundle plus artifacts under NEXUS_ARTIFACT_ROOT in the runtime dir, and
-    // Daytona's own session-command log — ~/.daytona/sessions/<sid>/<cmd>/output.log,
-    // unrotated and ON that disk. 3 GiB is Daytona's documented default (min disk class
-    // 1, org max 10), and it is effectively free: $0.000108/GiB-h with the first 5 GiB
-    // included, and usage never affects the bill — only the reserved class does.
-    // Explicit --cpu/--mem/--disk still win, which is what --mode remote-build needs: an
-    // in-sandbox cargo build (fat LTO, 149 crates) wants a ~1.9 GiB target dir and more
-    // than one core. NOTE: resource knobs apply per-create only on the inline-image
-    // path; a create-from-snapshot inherits the SNAPSHOT's baked resources and merely
-    // warns on a mismatch (setup-sandbox.ts:979-986). This account hits the fallback
-    // (snapshot writes answer 403), so these numbers are what actually lands on CREATE.
-    cpu: flags.cpu ?? 1,
-    mem: flags.mem ?? 1,
-    disk: flags.disk ?? 3,
-});
+export const buildSandboxOptions = (flags: StartDaytonaFlags, env: Readonly<Record<string, string | undefined>> = process.env): CreateSandboxOptions => {
+    // §12.3 admin auth is applied to the NEW runner at boot. The file env form
+    // wins inside createSandbox (resolveAdminAuth: file first, then token), which
+    // is why resolveAdminBearer resolves in the SAME order for the Bearer the
+    // deploy child sends. Only present knobs are spread, so a run with no admin
+    // material keeps the exact option record it had before.
+    const adminToken = adminTokenFrom(flags, env);
+    return {
+        // '' means "not given" (the parser's absent marker) → env/vault fallback.
+        apiKey: flags.apiKey || undefined,
+        ttlMinutes: flags.ttl,
+        public: flags.public,
+        snapshot: flags.snapshot,
+        ...(adminToken ? { adminToken } : {}),
+        ...(env[ADMIN_TOKEN_FILE_ENV] ? { adminTokenFile: env[ADMIN_TOKEN_FILE_ENV] as string } : {}),
+        // cpu/mem stay at the CPU-class FLOOR (1 vCPU / 1 GiB) on purpose — NOT the
+        // service's 4/8/10 (setup-sandbox.ts:231, which is what a bare createSandbox would
+        // inherit through `undefined`). Measured on the deployed hub 2026-11-12: 7.7 MB RSS,
+        // ~0.25 ms CPU per request, dispatch latency 0 ms, so the smallest legal CPU class
+        // serves the hub; this org's CPU class caps at 4 vCPU / 8 GiB / 10 GiB anyway
+        // (setup-sandbox.ts:117-123). RAM stays there because Daytona enforces `memory` as a
+        // HARD limit with Memory == MemorySwap (no swap headroom) AND a larger class is the
+        // only thing that raises the bill: Daytona charges reserved class × wall-clock.
+        //
+        // DISK moved to 3 GiB (from 1) because the old comment sized it from that same
+        // 7.7 MB hub measurement, which never measured the disk at all. What actually
+        // occupies the sandbox disk is everything BESIDES the hub's RSS: the runner process
+        // beside it (measured 67.9 MB baseline, 171–228 MB after real upload churn), the
+        // staged bundle plus artifacts under NEXUS_ARTIFACT_ROOT in the runtime dir, and
+        // Daytona's own session-command log — ~/.daytona/sessions/<sid>/<cmd>/output.log,
+        // unrotated and ON that disk. 3 GiB is Daytona's documented default (min disk class
+        // 1, org max 10), and it is effectively free: $0.000108/GiB-h with the first 5 GiB
+        // included, and usage never affects the bill — only the reserved class does.
+        // Explicit --cpu/--mem/--disk still win, which is what --mode remote-build needs: an
+        // in-sandbox cargo build (fat LTO, 149 crates) wants a ~1.9 GiB target dir and more
+        // than one core. NOTE: resource knobs apply per-create only on the inline-image
+        // path; a create-from-snapshot inherits the SNAPSHOT's baked resources and merely
+        // warns on a mismatch (setup-sandbox.ts:979-986). This account hits the fallback
+        // (snapshot writes answer 403), so these numbers are what actually lands on CREATE.
+        cpu: flags.cpu ?? 1,
+        mem: flags.mem ?? 1,
+        disk: flags.disk ?? 3,
+    };
+};
 
 /** The endpoint + token a deploy run is pointed at (fresh fills these in after createSandbox). */
 export type DeployTarget = { endpoint: string; token?: string };
@@ -483,20 +606,27 @@ export type DeployTarget = { endpoint: string; token?: string };
 /**
  * The exact argv handed to the child. Ordering is fixed and documented so the
  * tests assert the whole array:
- *   --endpoint, --token?, --mode, --port, --env…, --no-build?, --artifact?, --no-wait?, --teardown?
- * `--token` is OMITTED when empty — the deploy script sends no auth header without
- * it (deploy-daytona.ts:133-135, 225-229), which is what keeps public endpoints working.
- * Teardown carries ONLY endpoint/token: mode, port and env are irrelevant to a
- * DELETE /, and forwarding them would imply they do something.
+ *   --endpoint, --token?, --admin-token?, --mode, --port?, --replace?, --env…,
+ *   --no-build?, --artifact?, --no-wait?, --teardown?
+ * `--token`/`--admin-token` are OMITTED when empty — the deploy script sends no
+ * auth header without them, which is what keeps public endpoints working.
+ * `--port` is OMITTED when the operator did not type one: absent is how the child
+ * (and the runner) expresses "auto-allocate" (§6.2 step 4).
+ * Teardown carries ONLY endpoint/credentials/--teardown: mode, port and env are
+ * irrelevant to a DELETE /apps/nexus, and forwarding them would imply they do
+ * something.
  */
 export const buildDeployArgs = (flags: StartDaytonaFlags, target: DeployTarget, mode: StartMode): string[] => {
     const args = ['--endpoint', target.endpoint];
     if (target.token) args.push('--token', target.token);
+    if (flags.adminToken) args.push('--admin-token', flags.adminToken);
     if (mode === 'teardown') {
         args.push('--teardown');
         return args;
     }
-    args.push('--mode', flags.mode, '--port', String(flags.port));
+    args.push('--mode', flags.mode);
+    if (flags.port !== undefined) args.push('--port', String(flags.port));
+    if (flags.replace) args.push('--replace');
     // Object insertion order == the order --env was typed (JS string-key guarantee).
     for (const [key, value] of Object.entries(flags.env)) args.push('--env', `${key}=${value}`);
     if (flags.noBuild) args.push('--no-build');
@@ -546,7 +676,7 @@ export type StartPlan = {
     sandboxOptions?: CreateSandboxOptions;
     invocation: DeployInvocation;
     /** How the hub URL will be obtained (teardown has none). */
-    hub?: { port: number; via: string };
+    hub?: { path: string; via: string };
 };
 
 /**
@@ -558,9 +688,12 @@ export const buildPlan = (flags: StartDaytonaFlags, env: Record<string, string |
     const resolved: DeployTarget = target ?? { endpoint: mode === 'fresh' ? PLACEHOLDER_ENDPOINT : flags.endpoint, token: flags.token || undefined };
     const plan: StartPlan = {
         mode,
-        sandboxOptions: mode === 'fresh' ? buildSandboxOptions(flags) : undefined,
+        sandboxOptions: mode === 'fresh' ? buildSandboxOptions(flags, env) : undefined,
         invocation: buildDeployInvocation(flags, resolved, mode, env),
-        hub: mode === 'teardown' ? undefined : { port: flags.port, via: `sandbox.getPreviewLink(${flags.port})` },
+        // v2 has no per-port preview link: the hub URL is the SAME endpoint plus
+        // this path, in fresh AND reuse mode. Nothing is minted, so nothing can
+        // fail at mint time either.
+        hub: mode === 'teardown' ? undefined : { path: HUB_PATH, via: `endpoint + ${HUB_PATH} (one runner origin; no per-port preview link)` },
     };
     return plan;
 };
@@ -586,37 +719,61 @@ export const buildPlan = (flags: StartDaytonaFlags, env: Record<string, string |
 export const needsPreviewToken = (publicFlag: boolean | undefined, token: string | undefined): boolean => publicFlag !== true && Boolean(token);
 
 /**
+ * The suffix both URL lines carry. `publicFlag === undefined` (REUSE mode) cannot
+ * claim "public", so a missing token reads as "[no token]" rather than a promise
+ * the script cannot keep.
+ */
+export const previewLabel = (publicFlag: boolean | undefined, token: string | undefined): string =>
+    needsPreviewToken(publicFlag, token) ? ' [x-daytona-preview-token required]' : publicFlag === true ? ' [public, no token]' : ' [no token]';
+
+/**
  * The machine-readable line. Key order is insertion order, and a token key is
  * emitted ONLY when needsPreviewToken says the header is actually required, so a
  * consumer's `token`/`hubToken` check means "send this header" rather than "Daytona
- * happened to hand back a string". In reuse mode `sandboxId`/`name`/`public` are
- * absent (that sandbox was never ours) and `hubUrl` is explicitly `null` (no handle
- * to mint a per-port preview link with) — a consumer must handle `null`, which is
- * why the key is kept instead of omitted.
+ * happened to hand back a string".
+ *
+ * `hubToken` is DERIVED from `token`, never passed separately: v2 mints no
+ * second per-port credential, and the compatibility name must be structurally
+ * incapable of drifting from the credential that actually works.
+ *
+ * `hubUrl` is always a concrete URL now (fresh and reuse alike), because it is
+ * endpoint + `/app/nexus/` — no SDK handle is needed. `hubPort` is emitted only
+ * when the operator explicitly chose one; absent means the runner auto-allocated
+ * and the port is not public contract anyway.
  */
 export const buildSummary = (input: {
     mode: StartMode;
     endpoint: string;
     token?: string;
-    /** null = this run could not mint it (reuse mode); fresh always has one. */
-    hubUrl: string | null;
-    hubToken?: string;
+    hubUrl: string;
     sandboxId?: string;
     name?: string;
     public?: boolean;
-    hubPort: number;
+    hubPort?: number;
 }): string =>
     JSON.stringify({
         mode: input.mode,
         endpoint: input.endpoint,
         ...(needsPreviewToken(input.public, input.token) ? { token: input.token } : {}),
         hubUrl: input.hubUrl,
-        ...(needsPreviewToken(input.public, input.hubToken) ? { hubToken: input.hubToken } : {}),
+        ...(needsPreviewToken(input.public, input.token) ? { hubToken: input.token } : {}),
         ...(input.sandboxId ? { sandboxId: input.sandboxId } : {}),
         ...(input.name ? { name: input.name } : {}),
         ...(input.public === undefined ? {} : { public: input.public }),
-        hubPort: input.hubPort,
+        ...(input.hubPort === undefined ? {} : { hubPort: input.hubPort }),
     });
+
+/**
+ * The dry-run view of createSandbox options: every non-secret knob verbatim, but
+ * `adminToken` (the runner's §12.3 credential) and `apiKey` (the Daytona API key)
+ * masked. A plan must be pasteable into a terminal/log without leaking either
+ * credential; the `adminTokenFile` PATH is kept — it is a location, not a secret.
+ */
+export const redactSandboxOptions = (options: CreateSandboxOptions): CreateSandboxOptions => ({
+    ...options,
+    ...(options.adminToken ? { adminToken: '***' } : {}),
+    ...(options.apiKey ? { apiKey: '***' } : {}),
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  INTERRUPT POLICY — pure decision first, then the thin signal wiring that uses it
@@ -625,8 +782,12 @@ export const buildSummary = (input: {
 /** The signals trapped while this process owns a BILLING sandbox. */
 export type StartSignal = 'SIGINT' | 'SIGTERM';
 
-/** How far a fresh run got — decides whether an interrupt owes a sandbox delete. */
-export type InterruptPhase = 'creating' | 'deploying' | 'minting';
+/**
+ * How far a fresh run got — decides whether an interrupt owes a sandbox delete.
+ * There is no 'minting' phase in v2: the hub URL is derived from the endpoint, so
+ * nothing can fail after a successful deploy except lifecycle work itself.
+ */
+export type InterruptPhase = 'creating' | 'deploying';
 
 /** What an interrupt is worth: the exit code to use, and whether a delete is owed. */
 export type InterruptDecision = {
@@ -649,7 +810,7 @@ export const INTERRUPT_DELETE_TIMEOUT_MS = 10_000;
  *   · no `created` handle — there is nothing to send the DELETE to;
  *   · phase 'creating' — createSandbox has not returned yet, and its own failure
  *     path already deletes on a failed bring-up, so deleting here would double-fire.
- * Anything else (deploying/minting with a handle in hand) is a sandbox this command
+ * Anything else (deploying with a handle in hand) is a sandbox this command
  * created seconds ago that would otherwise bill forever.
  */
 export const decideInterruptCleanup = (input: {
@@ -764,9 +925,14 @@ export type SandboxHandle = {
     sandboxId: string;
     name?: string;
     public?: boolean;
+    /** Presence-only form of the runner's boot admin auth (CreateSandboxResult.adminAuth). */
+    adminAuth?: 'file' | 'env' | 'none';
     sandbox: {
         delete: () => Promise<unknown>;
-        getPreviewLink: (port: number) => Promise<{ url: string; token?: string }>;
+        // NO getPreviewLink: v2 exposes one origin and every app as a path under
+        // it, so there is no per-port link to mint (§16.1 P-7/P-8). Keeping it out
+        // of this structural type is what makes an accidental reintroduction a
+        // compile error rather than a silent second-credential bug.
     };
 };
 
@@ -803,6 +969,20 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
     const error = deps.error ?? ((line: string) => console.error(line));
     const env = deps.env ?? process.env;
     const mode = resolveMode(flags);
+    // §12.3 admin auth has TWO consumers: createSandbox applies it to a fresh
+    // runner at boot; the deploy child sends it as Authorization: Bearer for the
+    // named POST/PUT/DELETE/log routes. resolveAdminBearer is the one precedence
+    // (file form first, matching the shared bring-up) so the two can never
+    // disagree. A file-sourced token reaches the child through its ENV — never
+    // argv — so it cannot appear in a process listing or a masked-argv print.
+    const admin = resolveAdminBearer(flags, env);
+    const childEnv: Record<string, string | undefined> = admin.source === 'file' ? { ...env, [NEXUS_ADMIN_TOKEN_ENV]: admin.token } : env;
+    // The file form WINS at boot (shared resolveAdminAuth). If --admin-token is also
+    // present, leaving it in the child argv would make the child send a DIFFERENT
+    // Bearer than the runner was booted with (the flag overrides the env in
+    // deploy-daytona's parseArgs). Blank it for the child; the env above carries the
+    // winning file token instead — same credential, never argv.
+    const childFlags: StartDaytonaFlags = admin.source === 'file' ? { ...flags, adminToken: '' } : flags;
 
     // ── dry run: plan only, and provably nothing else (no createSandbox, no spawn) ──
     if (flags.dryRun) {
@@ -811,20 +991,28 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
         log(`${PREFIX} mode: ${plan.mode}`);
         if (plan.sandboxOptions) {
             log(`${PREFIX} sandbox options that WOULD be used:`);
-            // JSON.stringify drops the undefined knobs, so the print is the effective config.
-            log(`  ${JSON.stringify(plan.sandboxOptions, null, 2).split('\n').join('\n  ')}`);
+            // JSON.stringify drops the undefined knobs, so the print is the effective
+            // config; redactSandboxOptions masks the API key and the admin token so a
+            // pasted plan never leaks either credential.
+            log(`  ${JSON.stringify(redactSandboxOptions(plan.sandboxOptions), null, 2).split('\n').join('\n  ')}`);
             log(`${PREFIX} (unset knobs keep the @services/daytona defaults, except resources: the sandbox defaults to the measured 1 vCPU / 1 GiB RAM hub footprint on 3 GiB disk (the Daytona default — the runner, the staged bundle/artifacts and the Daytona session log all live there); --ttl unset means NO kill fence)`);
         }
         log(`${PREFIX} deploy command that WOULD run (cwd ${plan.invocation.cwd}):`);
-        log(`  ${plan.invocation.command} ${plan.invocation.args.join(' ')}`);
+        // Mask the value of every --token/--admin-token pair: a dry run must be
+        // pasteable without leaking either credential (the admin bearer especially).
+        log(`  ${plan.invocation.command} ${redactSecretArgs(plan.invocation.args).join(' ')}`);
         if (plan.hub) log(`${PREFIX} hub URL after success: ${plan.hub.via}`);
+        // Reuse never boots the runner, so it cannot apply a boot-time credential.
+        // Say that here, where the operator is looking at the plan.
+        if (plan.mode === 'reuse' && admin.source !== 'none')
+            log(`${PREFIX} admin auth: the ${admin.source}-form credential is sent as the deploy Bearer ONLY — reuse does not boot or reboot the runner, so its ${ADMIN_TOKEN_ENV}/${ADMIN_TOKEN_FILE_ENV} must already be configured there`);
         return 0;
     }
 
-    // ── teardown: free the runtime slot; the sandbox itself keeps billing ──
+    // ── teardown: remove the APP; the sandbox itself keeps billing ──
     if (mode === 'teardown') {
-        log(`${PREFIX} tearing down the runtime slot at ${flags.endpoint} (DELETE / — the SANDBOX is not deleted)`);
-        const code = await deps.spawn(buildDeployInvocation(flags, { endpoint: flags.endpoint, token: flags.token || undefined }, mode, env));
+        log(`${PREFIX} tearing down app "${APP_NAME}" at ${flags.endpoint} (DELETE /apps/${APP_NAME} — the SANDBOX is not deleted)`);
+        const code = await deps.spawn(buildDeployInvocation(childFlags, { endpoint: flags.endpoint, token: flags.token || undefined }, mode, childEnv));
         if (code !== 0) error(`${PREFIX} ✗ teardown failed (exit ${code}) — see the deploy output above`);
         return code;
     }
@@ -832,24 +1020,27 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
     // ── reuse: someone else's sandbox, so no lifecycle work ever ──
     if (mode === 'reuse') {
         log(`${PREFIX} deploying into the existing endpoint ${flags.endpoint} (not created here — no sandbox lifecycle actions)`);
-        const code = await deps.spawn(buildDeployInvocation(flags, { endpoint: flags.endpoint, token: flags.token || undefined }, mode, env));
+        // Reuse cannot change the runner's BOOT credential. The Bearer still goes to
+        // the child so an already-configured runner authorizes this deploy; do not
+        // imply the --admin-token flag reconfigured anything here.
+        if (admin.source !== 'none')
+            log(`${PREFIX} ! admin auth: the ${admin.source}-form credential is sent as the deploy Bearer only — reuse cannot enable or change the runner's boot-time ${ADMIN_TOKEN_ENV}/${ADMIN_TOKEN_FILE_ENV}; restart/reboot the sandbox or use fresh mode to apply it`);
+        const code = await deps.spawn(buildDeployInvocation(childFlags, { endpoint: flags.endpoint, token: flags.token || undefined }, mode, childEnv));
         if (code === 0) {
-            // NO hub URL here, deliberately: the hub listens on its own port inside
-            // that sandbox, and the only way to mint its preview link is the SDK
-            // handle (getPreviewLink) — which createSandbox owns and reuse mode
-            // never had. Guessing the URL from the endpoint (port substitution)
-            // would be worse than printing null, because the per-port preview token
-            // cannot be guessed either.
+            // v2 mints nothing: every app is a path under the one runner origin, so
+            // the hub URL is derivable from the endpoint this mode was GIVEN. No SDK
+            // handle, no second token, and nothing that can fail after a good deploy.
+            const hubUrl = hubUrlFor(flags.endpoint);
             log(`${PREFIX} ✓ deploy ready on ${flags.endpoint}`);
-            log(`${PREFIX}   hub URL (clients connect here): not minted — reuse mode holds no sandbox handle; run getPreviewLink(${flags.port}) on the owning sandbox`);
-            log(`${PREFIX}   management endpoint (POST/status/logs): ${flags.endpoint}`);
-            // LAST line, single-line JSON; `hubUrl: null` = "not minted here" (header).
-            log(buildSummary({ mode, endpoint: flags.endpoint, token: flags.token || undefined, hubUrl: null, hubPort: flags.port }));
+            log(`${PREFIX}   hub URL (clients connect here)${previewLabel(undefined, flags.token)}: ${hubUrl}`);
+            log(`${PREFIX}   management endpoint (control plane: /health /apps /apps/${APP_NAME}/logs)${previewLabel(undefined, flags.token)}: ${flags.endpoint}`);
+            // LAST line, single-line JSON; `hubToken` is the same runner-origin token.
+            log(buildSummary({ mode, endpoint: flags.endpoint, token: flags.token || undefined, hubUrl, hubPort: flags.port }));
         } else error(`${PREFIX} ✗ deploy failed (exit ${code}) — the deploy output above is the diagnosis; nothing was created, so nothing to clean up`);
         return code;
     }
 
-    // ── fresh: create → deploy → mint the hub URL ──
+    // ── fresh: create → deploy → derive the hub URL ──
     // createSandbox is QUIET by default, and a bring-up takes minutes, so progress is
     // forwarded through the prefixed sink (multi-line chunks are indented, matching
     // the CLI sink's treatment of raw Daytona build output, setup-sandbox.ts:420-421).
@@ -858,8 +1049,19 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
     // Daytona build output through the same callback, so level-based filtering would
     // hide exactly the progress an operator wants while a create takes minutes.
     const sandboxLog: SandboxLog = (message) => log(`${PREFIX}   ${String(message).replace(/\n+/g, '\n  ')}`);
-    const created = await deps.createSandbox({ ...buildSandboxOptions(flags), log: sandboxLog });
+    // The file form wins inside createSandbox (§12.3 resolveAdminAuth), so an
+    // explicit --admin-token next to SANDBOX_ADMIN_TOKEN_FILE would otherwise be a
+    // silent mismatch: the boot credential is the file's, and the deploy Bearer is
+    // resolved from that SAME file by resolveAdminBearer. Say which one won.
+    if (admin.source === 'file' && flags.adminToken)
+        log(`${PREFIX} ! both --admin-token and ${ADMIN_TOKEN_FILE_ENV} are set — the file form wins for the runner boot (§12.3), and the deploy Bearer is that same file token`);
+    const created = await deps.createSandbox({ ...buildSandboxOptions(flags, env), log: sandboxLog });
     log(`${PREFIX} ✓ sandbox ${created.sandboxId}${created.name ? ` (${created.name})` : ''} ready — management endpoint ${created.endpoint}`);
+    // Presence-only (never the value): what the new runner was actually booted with.
+    // Printed only when admin material exists, so the ordinary unauthenticated run
+    // keeps its exact line sequence.
+    if (admin.source !== 'none' || (created.adminAuth !== undefined && created.adminAuth !== 'none'))
+        log(`${PREFIX}   runner admin auth (${ADMIN_TOKEN_ENV}/${ADMIN_TOKEN_FILE_ENV}): ${created.adminAuth === undefined ? 'not reported' : `${created.adminAuth} form`}`);
 
     // ── R1 — the interrupt fence (fresh mode ONLY, and only for the window in which
     // this process really owns a BILLING sandbox: created → flow end). Before this,
@@ -871,7 +1073,7 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
 
     // Everything after the create, as ONE unit the guard can abandon mid-flight.
     const finish = async (): Promise<number> => {
-        const code = await deps.spawn(buildDeployInvocation(flags, { endpoint: created.endpoint, token: created.token }, mode, env));
+        const code = await deps.spawn(buildDeployInvocation(childFlags, { endpoint: created.endpoint, token: created.token }, mode, childEnv));
         // A signal during the deploy means the guard already owns the cleanup; running
         // the deploy-failure delete here too would delete twice and print a lie.
         if (guard.interrupted()) return code;
@@ -894,41 +1096,28 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
             return code;
         }
 
-        // The hub listens on its OWN port inside the sandbox, so its URL is a separate
-        // per-port preview link — possibly with a token of its own when private.
-        phase.current = 'minting';
-        let hubUrl: string;
-        let hubToken: string | undefined;
-        try {
-            const link = await created.sandbox.getPreviewLink(flags.port);
-            hubUrl = link.url;
-            hubToken = link.token || undefined;
-        } catch (mintError) {
-            // The deploy SUCCEEDED: the hub is running and the sandbox is paid for, so
-            // deleting it here would destroy the very thing the command was for.
-            error(`${PREFIX} ✗ deploy is ready but the hub preview URL could not be minted: ${describe(mintError)}`);
-            error(`${PREFIX}   sandbox ${created.sandboxId} LEFT RUNNING (billing) — mint getPreviewLink(${flags.port}) yourself`);
-            error(`${PREFIX}   management endpoint, still usable: ${created.endpoint}`);
-            return 1;
-        }
+        // The deploy SUCCEEDED, so the hub URL is a pure function of the endpoint:
+        // endpoint + /app/nexus/. There is no second preview link and no mint
+        // failure path — the one credential is the runner-origin preview token.
+        const hubUrl = hubUrlFor(created.endpoint);
+        const hubToken = created.token;
 
-        // An interrupt that landed while the URL was being minted still wins: the run
-        // is about to delete the sandbox and exit 130/143, so printing a success line
-        // and the machine-readable contract would send a consumer to a dead sandbox.
+        // An interrupt that landed while the deploy was finishing still wins: the
+        // run is about to delete the sandbox and exit 130/143, so printing a
+        // success line and the machine-readable contract would send a consumer to
+        // a dead sandbox.
         if (guard.interrupted()) return 0;
 
-        log(`${PREFIX} ✓ nexus hub is live`);
-        // The hub's preview link is authenticated with the SAME header Daytona uses for
-        // every preview URL (setup-sandbox.ts `PREVIEW_TOKEN_HEADER`, deploy-daytona.ts:225)
-        // — naming a header that does not exist sends operators on a wild goose chase.
-        // Whether that header is NEEDED is visibility, not token presence (needsPreviewToken):
-        // a public sandbox — this script's default — is handed a token by Daytona as well,
-        // and calling its URL "[x-daytona-preview-token required]" told the operator the
-        // hub was authenticated when a bare GET to it works fine.
-        log(`${PREFIX}   hub URL (clients connect here)${needsPreviewToken(created.public, hubToken) ? ' [x-daytona-preview-token required]' : ' [public, no token]'}: ${hubUrl}`);
-        log(`${PREFIX}   management endpoint (POST/status/logs)${needsPreviewToken(created.public, created.token) ? ' [x-daytona-preview-token]' : ' [no token]'}: ${created.endpoint}`);
+        log(`${PREFIX} ✓ nexus app is live at ${APP_PATH}`);
+        // One origin, one preview token. Naming a header that does not exist sends
+        // operators on a wild goose chase; whether the header is NEEDED is
+        // visibility, not token presence (needsPreviewToken): a public sandbox —
+        // this script's default — is handed a token by Daytona as well.
+        log(`${PREFIX}   hub URL (clients connect here)${previewLabel(created.public, hubToken)}: ${hubUrl}`);
+        log(`${PREFIX}   management endpoint (control plane: /health /apps /apps/${APP_NAME}/logs)${previewLabel(created.public, created.token)}: ${created.endpoint}`);
         log(`${PREFIX}   sandbox ${created.sandboxId} — bills until sandbox.delete()${flags.ttl === undefined ? ' (no --ttl fence was set)' : ` or its ${flags.ttl}-minute TTL fires`}`);
-        if (!flags.wait) log(`${PREFIX}   (--no-wait: the deploy was accepted, the hub may still be booting — probe the hub URL)`);
+        log(`${PREFIX}   internal app port: ${flags.port === undefined ? 'auto-allocated by the runner (no --port given)' : `${flags.port} (explicit; still not public — clients use ${APP_PATH})`}`);
+        if (!flags.wait) log(`${PREFIX}   (--no-wait: the deploy was accepted, the app may still be booting — probe the hub URL)`);
         // LAST line, single-line JSON — the machine-readable contract in the header.
         log(
             buildSummary({
@@ -936,10 +1125,11 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
                 endpoint: created.endpoint,
                 token: created.token,
                 hubUrl,
-                hubToken,
                 sandboxId: created.sandboxId,
                 name: created.name,
                 public: created.public,
+                // Only an EXPLICIT port is reported: absent means auto, and the
+                // internal port is never part of the public contract.
                 hubPort: flags.port,
             }),
         );
@@ -989,7 +1179,7 @@ export type SpawnImpl = (command: string, args: readonly string[], options: { cw
 
 /**
  * The real child-process dep: stdio INHERIT so the deploy script's `>>>`/`✓`
- * progress and its final /status JSON reach the terminal untouched, and the child's
+ * progress and its final AppView JSON reach the terminal untouched, and the child's
  * exit code becomes this command's exit code. A spawn-level failure (no vite-node CLI on
  * PATH) resolves 1 rather than rejecting, so the caller still exits 1 with a line.
  */

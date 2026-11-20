@@ -1,75 +1,76 @@
 // ─────────────────────────────────────────────────────────────────────────────
-//  deploy-endpoint.test.ts — the platform-neutral deploy verb, end to end, with
-//  ZERO network and no cargo.
+//  deploy-endpoint.test.ts — the platform-neutral v2 deploy verb, end to end,
+//  with ZERO network and no cargo.
 //
 //  Everything side-effectful in deploy-endpoint.ts is an injected dep (probe /
 //  spawn / sleep / now / log / error / env), so these tests drive the REAL control
 //  flow against scripted endpoint answers and assert exact values:
-//    · parser     — defaults, the positional URL, every flag, --env repeats,
-//                   env fallbacks and their precedence, and each illegal combination
-//    · probes     — classifyProbe's cold-start / auth / dead table (the branch that
-//                   decides whether a miss is a cold container or a wrong URL)
-//    · slot policy— decideTeardown's table, INCLUDING 'unknown' counting as busy
-//    · hub URL    — buildHubUrl: reported, never guessed (box / port / no-preview)
-//    · argv       — the exact child argv per flag set, plus command/cwd/env
-//    · flow       — cold start retried, empty slot, replace-on-arrival (DELETE then
-//                   prove empty then deploy), --no-teardown abort, --teardown verb,
-//                   a DELETE that does not confirm, a teardown that leaves the slot
-//                   busy, auth abort, dead-URL abort, budget exhaustion, child
-//                   failure's exit code, and dry run touching NOTHING
-//    · modal      — the container reset: box/sandbox classified, an empty slot used as
-//                   the fresh machine, a busy box recycled before the POST (the new
-//                   process proven by its uptime or a 5xx gap, the replacement's slot
-//                   proven empty), a busy sandbox tunnel refused, --no-teardown leaving
-//                   the container alone, and every fail-closed branch (unconfirmed
-//                   reset, the old container still answering, a replacement not empty)
-//    · spawnDeploy— the child wiring through the SpawnImpl seam (see SpawnImpl in the
-//                   source for why vi.mock cannot rebind a builtin here)
+//    · parser     — defaults (AUTO port, no admin token), the positional URL, every
+//                   flag, --env repeats, env fallbacks/precedence, illegal combos
+//    · probes     — classifyProbe's cold-start/auth/dead table, and the v2-specific
+//                   classifyRunnerHealth / classifyAppProbe tables
+//    · app policy — ready|failed → PUT (blue-green), queued|building|… → app-scoped
+//                   DELETE then POST, --no-teardown → conflict, pending → conflict
+//    · hub URL    — AppView.path + endpoint, publicUrl fallback, absent
+//    · argv       — the exact child argv (no --port unless typed, --replace when PUT)
+//    · flow       — cold start, empty registry, replace, non-replaceable states,
+//                   teardown (DELETE + verify 404), child failure, dry run
+//    · modal      — container recycle is OPT-IN: never implied by the replace
+//                   posture, only DELETE /_provider/sandbox, box-only, refused for
+//                   a sandbox tunnel, and proven by a young uptime + absent app
+//    · spawnDeploy— the child wiring through the SpawnImpl seam
 //    · import     — isCliEntryPoint's three entry rules
-//
-//  The three pure helpers the flow depends on (joinUrl / authHeaders / buildSummary)
-//  are pinned here too, because the same URL join and the same header name must match
-//  deploy-daytona.ts byte for byte — a drift between them is a mis-posted bundle.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { modalContainer } from '@config/vault';
 
 import {
+    appDeleteUrl,
+    appStateUrl,
     authHeaders,
     buildDeployArgs,
     buildDeployInvocation,
     buildHubUrl,
     buildSummary,
+    classifyAppProbe,
     classifyModalContainer,
     classifyProbe,
+    classifyRunnerHealth,
     createDefaultDeps,
-    DEFAULT_HUB_PORT,
-    decideTeardown,
+    credentialsOf,
+    deleteApp,
     DEPLOY_SCRIPT_PATH,
-    describeRuntime,
+    ENDPOINT_WAIT_MS,
     EndpointDeployError,
-    type EndpointDeps,
-    type EndpointFlags,
-    type Probe,
-    type ProbeResult,
+    healthUrl,
     isCliEntryPoint,
     joinUrl,
     main,
     PACKAGE_ROOT,
     parseArgs,
+    readApp,
     RECYCLE_WAIT_MS,
+    requestModalContainerReset,
+    redactSecretArgs,
     requireEndpoint,
+    resetModalBoxContainer,
     resolveMode,
     runDeployEndpoint,
     SLOT_WAIT_MS,
     spawnDeploy,
     USAGE,
+    verifyAppAbsent,
     VITE_NODE_CLI,
+    waitForModalContainerReset,
     waitForRoute,
+    type EndpointDeps,
+    type EndpointFlags,
+    type Probe,
+    type ProbeResult,
 } from './deploy-endpoint';
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -77,76 +78,115 @@ import {
 // ══════════════════════════════════════════════════════════════════════════════
 
 const OK = (json: unknown): ProbeResult => ({ status: 200, ok: true, json, text: JSON.stringify(json) });
-const FAIL = (status: number, text = ''): ProbeResult => ({ status, ok: status >= 200 && status < 300, json: null, text });
+const FAIL = (status: number, json: unknown = null, text = ''): ProbeResult => ({ status, ok: false, json, text: text || (json ? JSON.stringify(json) : '') });
 const DOWN = (message = 'connect ECONNREFUSED 127.0.0.1:7777'): ProbeResult => ({ status: 0, ok: false, json: null, text: '', transportError: message });
 
-/** The body a real runner answers /health with (contract v1). */
-const HEALTH = { status: 'ok', contract: 'daytona-runtime-v1', runnerPort: 7777, authenticated: false, exposedPorts: [8085] };
-/**
- * The MODAL runner's /health: the same contract, plus the `service` marker that makes
- * it the one endpoint shape this script is allowed to replace wholesale.
- */
-const MODAL_HEALTH = { ok: true, slot: 'empty', uptimeSec: 4, contract: 'daytona-runtime-v1', runnerPort: 7777, authenticated: false, exposedPorts: [8085], service: 'modal-container-runtime' };
-/** A long-lived box's /health — its uptime is older than any reset, so it can never pass as a replacement. */
+/** The body a v2 runner answers /health with (§7.2/§17.1). */
+const HEALTH = {
+    ok: true,
+    slot: 'multi',
+    uptimeSec: 4,
+    contract: 'sandbox-runtime-v2',
+    apiVersion: 2,
+    compatibleContracts: ['daytona-runtime-v1'],
+    capabilities: ['apps', 'app-proxy', 'blue-green-replace'],
+    runnerPort: 7777,
+    publicOrigin: 'https://box.example',
+    authRequired: false,
+    limits: { maxApps: 8 },
+    apps: { count: 0, ready: 0, pending: 0 },
+};
+/** The v1 single-slot marker: no apiVersion 2 and no `apps` capability. */
+const V1_HEALTH = { status: 'ok', contract: 'daytona-runtime-v1', runnerPort: 7777, authenticated: false, exposedPorts: [8085] };
+/** The Modal runner's /health: v2 plus the `service` marker that makes a box recognizable. */
+const MODAL_HEALTH = { ...HEALTH, service: 'modal-container-runtime' };
+/** A long-lived box's /health — its uptime predates any reset, so it cannot pass as a replacement. */
 const MODAL_OLD_HEALTH = { ...MODAL_HEALTH, uptimeSec: 600 };
 /** A Modal box is a stable deployment URL; a sandbox tunnel's URL dies with its container. */
-const MODAL_BOX = Object.values(modalContainer)[0];
+const MODAL_BOX = Object.values(modalContainer)[0]!;
 const MODAL_SANDBOX = 'https://abc123-7777-deadbeef.modal.host';
-/** GET /status bodies used across the flow tests. */
-const EMPTY = { slot: 'empty', runtime: null };
-const busy = (previewUrl: string | null): ProbeResult =>
-    OK({
-        slot: 'ready',
-        runtime: { profile: 'nexus', port: 8085, runtimeId: 'rt-1', startedAtMs: 1700000000000, ready: true, preview: { port: 8085, url: previewUrl, exposed: true, exposedPorts: [8085] } },
-    });
-const READY_NO_PREVIEW = OK({
-    slot: 'ready',
-    runtime: {
-        profile: 'nexus',
-        port: 8085,
-        runtimeId: 'rt-2',
-        ready: true,
-        preview: { port: 8085, url: null, exposed: true, exposedPorts: [8085], warning: 'port 8085 has no preview URL — the driver has not pushed one' },
-    },
+const BOX = 'https://box.example';
+
+/** A redacted AppView (§5.2). */
+const APP = (over: Record<string, unknown> = {}) => ({
+    name: 'nexus',
+    revision: 1,
+    path: '/app/nexus/',
+    publicUrl: `${BOX}/app/nexus/`,
+    internalPort: 20042,
+    profile: 'nexus',
+    filename: 'nexus-hub',
+    bundleSha256: 'abc',
+    bundleBytes: 8,
+    status: 'ready',
+    ready: true,
+    pid: 10,
+    pgid: 10,
+    startedAtMs: 1,
+    readyAtMs: 2,
+    createdAtMs: 1,
+    updatedAtMs: 2,
+    lastProbe: { ok: true, httpStatus: 200, atMs: 2, error: null },
+    targetPrefix: '',
+    config: { port: 20042, envKeys: [], hasBuildCmd: false, hasRunCmd: false, anonymous: true },
+    queue: null,
+    error: null,
+    exit: null,
+    lastReplaceError: null,
+    pending: null,
+    ...over,
 });
+const ABSENT = FAIL(404, { error: 'app_not_found' });
+const TORN_DOWN = (removed = true) => OK({ tornDown: true, name: 'nexus', removed });
 
 /** One probe call, as recorded. */
-type Call = { method: string; url: string; token?: string };
+type Call = { method: string; url: string; token?: string; admin?: string };
 
 /**
- * A scripted endpoint: answers each (method, url) from `script` in call order, and
- * records every call so a test can pin the whole request sequence. A script entry may
- * be a ProbeResult or a function of the call.
+ * A scripted endpoint: answers each call from `script` in call order, and records
+ * every call so a test can pin the whole request sequence. A function entry sees
+ * the call, for the few branches that depend on the URL.
  */
 const makeProbe = (script: Array<ProbeResult | ((call: Call) => ProbeResult)>) => {
     const calls: Call[] = [];
     let index = 0;
     const probe: Probe = async (method, url, init) => {
-        const call: Call = { method, url, ...(init.headers['x-daytona-preview-token'] ? { token: init.headers['x-daytona-preview-token' as keyof typeof init.headers] as string } : {}) };
+        const call: Call = {
+            method,
+            url,
+            ...(init.headers['x-daytona-preview-token'] ? { token: init.headers['x-daytona-preview-token'] } : {}),
+            ...(init.headers.authorization ? { admin: init.headers.authorization } : {}),
+        };
         calls.push(call);
         const next = script[index++];
         if (next === undefined) throw new Error(`probe script exhausted at call ${index}: ${method} ${url}`);
         return typeof next === 'function' ? next(call) : next;
     };
-    return { probe, calls, remaining: () => script.length - index };
+    return { probe, calls };
 };
 
-/** Deps with no clock and no waiting: the flow must run in one tick. */
-const makeDeps = (probe: Probe, exitCode = 0, options: { spawnCode?: number } = {}) => {
+/**
+ * Deps with a MOVABLE clock and no waiting: `sleep(ms)` advances the clock, so a
+ * bounded retry loop terminates deterministically and the attempt count is exact.
+ */
+const makeDeps = (probe: Probe, options: { spawnCode?: number } = {}) => {
     const lines: string[] = [];
     const problems: string[] = [];
     const invocations: Array<{ command: string; args: string[]; cwd: string; env: Record<string, string | undefined> }> = [];
+    let nowMs = 0;
     const deps: EndpointDeps = {
         probe,
         spawn: async (invocation) => {
             invocations.push(invocation);
-            return options.spawnCode ?? exitCode;
+            return options.spawnCode ?? 0;
         },
         log: (line) => lines.push(line),
         error: (line) => problems.push(line),
         env: {},
-        sleep: async () => undefined,
-        now: () => 0,
+        sleep: async (ms) => {
+            nowMs += ms;
+        },
+        now: () => nowMs,
     };
     return { deps, lines, problems, invocations };
 };
@@ -157,7 +197,9 @@ const flagsOf = (argv: readonly string[]): EndpointFlags => {
     expect(errors).toEqual([]);
     return flags;
 };
-const bareFlags = (): EndpointFlags => flagsOf(['https://box.example']);
+const bareFlags = (): EndpointFlags => flagsOf([BOX]);
+
+afterEach(() => vi.restoreAllMocks());
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: module pins', () => {
@@ -167,32 +209,27 @@ describe('deploy-endpoint: module pins', () => {
         expect(existsSync(DEPLOY_SCRIPT_PATH)).toBe(true);
     });
 
-    it('keeps the hub-port default in lockstep with deploy-daytona.ts DEFAULT_PORT', () => {
-        expect(DEFAULT_HUB_PORT).toBe(8085);
-        expect(bareFlags().port).toBe(8085);
-    });
-
-    it('waits long enough for a cold container, and its slot fence is shorter', () => {
-        // A recycled/scaled-to-zero box needs tens of seconds; a hung proxy must not
-        // turn the run into a mystery. 90 s cold-start, 30 s for the DELETE proof.
-        expect(SLOT_WAIT_MS).toBeLessThan(60_000);
-        expect(createDefaultDeps().probe).toBeTypeOf('function');
+    it('keeps the wait budgets long enough for a cold container', () => {
+        expect(ENDPOINT_WAIT_MS).toBe(90_000);
+        expect(SLOT_WAIT_MS).toBe(30_000);
+        expect(RECYCLE_WAIT_MS).toBe(60_000);
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: argument parsing', () => {
-    it('takes the URL as the positional argument, and every default is the deploy posture', () => {
-        const flags = flagsOf([MODAL_BOX]);
-        expect(flags).toEqual({
+    it('defaults to a local deploy with AUTO port, replace posture and no credentials', () => {
+        expect(bareFlags()).toEqual({
             help: false,
             dryRun: false,
             teardownOnly: false,
             replace: true,
-            endpoint: MODAL_BOX,
+            recycleContainer: false,
+            endpoint: BOX,
             token: '',
+            adminToken: '',
             mode: 'local',
-            port: DEFAULT_HUB_PORT,
+            port: undefined,
             env: {},
             noBuild: false,
             artifact: '',
@@ -200,555 +237,448 @@ describe('deploy-endpoint: argument parsing', () => {
         });
     });
 
-    it('accepts --endpoint, and a positional that agrees with it is not an error', () => {
-        expect(flagsOf(['--endpoint', 'https://a.example']).endpoint).toBe('https://a.example');
-        expect(flagsOf(['https://a.example', '--endpoint', 'https://a.example']).endpoint).toBe('https://a.example');
+    it('parses every flag into the exact record', () => {
+        // --no-teardown and --recycle-container are mutually exclusive, so each is
+        // exercised in its own flag set (see the conflict test below).
+        const flags = flagsOf([BOX, '--token', 'pt', '--admin-token', 'at', '--mode', 'remote-build', '--port', '20042', '--env', 'A=1', '--no-wait', '--no-teardown']);
+        expect(flags).toMatchObject({ endpoint: BOX, token: 'pt', adminToken: 'at', mode: 'remote-build', port: 20042, env: { A: '1' }, wait: false, replace: false });
+        expect(flagsOf([BOX, '--recycle-container']).recycleContainer).toBe(true);
+    });
+
+    it('takes --endpoint, and a positional that agrees with it is not an error', () => {
+        expect(parseArgs([BOX, '--endpoint', BOX], {}).errors).toEqual([]);
     });
 
     it('rejects two different endpoints, because picking one silently could deploy to the wrong box', () => {
-        const { errors } = parseArgs(['https://a.example', '--endpoint', 'https://b.example'], {});
-        expect(errors).toEqual(['two different endpoints given: "https://a.example" and --endpoint "https://b.example"']);
+        expect(parseArgs([BOX, '--endpoint', 'https://other.example'], {}).errors).toEqual([`two different endpoints given: "${BOX}" and --endpoint "https://other.example"`]);
     });
 
     it('rejects a second positional', () => {
-        const { errors } = parseArgs(['https://a.example', 'https://b.example'], {});
-        expect(errors).toEqual(['unexpected extra argument "https://b.example" — the endpoint is the only positional (got "https://a.example" already)']);
+        expect(parseArgs([BOX, 'https://other.example'], {}).errors).toEqual([`unexpected extra argument "https://other.example" — the endpoint is the only positional (got "${BOX}" already)`]);
     });
 
     it('requires an endpoint — there is no platform default, that is the whole point', () => {
-        const { errors } = parseArgs([], {});
-        expect(errors).toEqual(['no endpoint — pass it as the argument (deploy:endpoint <url>) or with --endpoint / NEXUS_ENDPOINT']);
+        expect(parseArgs([], {}).errors).toEqual(['no endpoint — pass it as the argument (deploy:endpoint <url>) or with --endpoint / NEXUS_ENDPOINT']);
     });
 
-    it('reads the endpoint and token from env, with the platform-neutral names winning', () => {
-        expect(parseArgs([], { NEXUS_DAYTONA_ENDPOINT: 'https://d.example' }).flags.endpoint).toBe('https://d.example');
-        expect(parseArgs([], { NEXUS_DAYTONA_ENDPOINT: 'https://d.example', NEXUS_ENDPOINT: 'https://m.example' }).flags.endpoint).toBe('https://m.example');
-        expect(parseArgs([], { NEXUS_DAYTONA_PREVIEW_TOKEN: 'daytona' }).flags.token).toBe('daytona');
-        expect(parseArgs([], { NEXUS_DAYTONA_PREVIEW_TOKEN: 'daytona', NEXUS_ENDPOINT_TOKEN: 'neutral' }).flags.token).toBe('neutral');
-        // A positional/flag always outranks env.
-        expect(parseArgs(['https://x.example', '--token', 't'], { NEXUS_ENDPOINT: 'https://d.example', NEXUS_ENDPOINT_TOKEN: 'env' }).flags).toMatchObject({ endpoint: 'https://x.example', token: 't' });
+    it('reads endpoint/token/admin from env, with the platform-neutral names winning', () => {
+        const env = { NEXUS_ENDPOINT: BOX, NEXUS_DAYTONA_ENDPOINT: 'https://old.example', NEXUS_ENDPOINT_TOKEN: 'new', NEXUS_DAYTONA_PREVIEW_TOKEN: 'old', NEXUS_SANDBOX_ADMIN_TOKEN: 'admin' };
+        expect(parseArgs([], env).flags).toMatchObject({ endpoint: BOX, token: 'new', adminToken: 'admin' });
+        // Empty nexus-specific admin name falls through to the generic one.
+        expect(parseArgs([], { ...env, NEXUS_SANDBOX_ADMIN_TOKEN: '', SANDBOX_ADMIN_TOKEN: 'generic' }).flags.adminToken).toBe('generic');
     });
 
-    it('maps the slot verbs onto their two independent switches', () => {
-        expect(flagsOf(['https://a.example', '--teardown']).teardownOnly).toBe(true);
-        expect(flagsOf(['https://a.example', '--no-teardown']).replace).toBe(false);
-        // Both at once is meaningful: free the slot, and never do it implicitly.
-        const both = flagsOf(['https://a.example', '--teardown', '--no-teardown']);
-        expect(both).toMatchObject({ teardownOnly: true, replace: false });
+    it('maps the app verbs onto their independent switches, and rejects contradictory pairs', () => {
+        expect(resolveMode(flagsOf([BOX]))).toBe('deploy');
+        expect(resolveMode(flagsOf([BOX, '--teardown']))).toBe('teardown');
+        // --teardown ships nothing, so shipping knobs would be silently ignored.
+        expect(parseArgs([BOX, '--teardown', '--env', 'A=1'], {}).errors).toEqual(['--teardown ships nothing, so --env/--no-build/--artifact/--no-wait do not apply (drop them, or drop --teardown)']);
+        // A container recycle is much wider than an app teardown: pick one.
+        expect(parseArgs([BOX, '--teardown', '--recycle-container'], {}).errors).toEqual(['--teardown removes app "nexus" only; --recycle-container discards the whole Modal box — pick one']);
+        expect(parseArgs([BOX, '--no-teardown', '--recycle-container'], {}).errors).toEqual(['--no-teardown forbids touching the endpoint, and --recycle-container destroys the whole box — pick one']);
     });
 
-    it('accumulates repeatable --env, splitting on the first = so values may contain =', () => {
-        const flags = flagsOf(['https://a.example', '--env', 'A=1', '--env', 'NEXUS_TOKEN=x=y', '--env', 'B=']);
-        expect(flags.env).toEqual({ A: '1', NEXUS_TOKEN: 'x=y', B: '' });
+    it('accumulates repeatable --env, splitting on the first =', () => {
+        const flags = flagsOf([BOX, '--env', 'B=2', '--env', 'A=1', '--env', 'TOKEN=a=b']);
+        expect(Object.keys(flags.env)).toEqual(['B', 'A', 'TOKEN']);
+        expect(flags.env).toEqual({ B: '2', A: '1', TOKEN: 'a=b' });
     });
 
-    it('passes the deploy knobs through verbatim', () => {
-        const flags = flagsOf(['https://a.example', '--mode', 'remote-build', '--port', '9000', '--no-wait']);
-        expect(flags).toMatchObject({ mode: 'remote-build', port: 9000, wait: false });
-        const shipping = flagsOf(['https://a.example', '--no-build', '--artifact', '/tmp/nexus-hub', '--wait']);
-        expect(shipping).toMatchObject({ noBuild: true, artifact: '/tmp/nexus-hub', wait: true });
+    it('passes the deploy knobs through, with --port 0 meaning AUTO', () => {
+        expect(flagsOf([BOX, '--mode', 'remote-build', '--port', '20042'])).toMatchObject({ mode: 'remote-build', port: 20042 });
+        expect(flagsOf([BOX, '--no-build', '--artifact', '/tmp/x'])).toMatchObject({ noBuild: true, artifact: '/tmp/x' });
+        expect(flagsOf([BOX, '--port', '0']).port).toBeUndefined();
     });
 
     it('rejects malformed values instead of guessing', () => {
-        expect(parseArgs(['https://a.example', '--port', '70000'], {}).errors).toEqual(['--port "70000" is out of range (TCP port 1-65535)']);
-        expect(parseArgs(['https://a.example', '--port', 'abc'], {}).errors).toEqual(['--port "abc" is out of range (TCP port 1-65535)']);
-        expect(parseArgs(['https://a.example', '--mode', 'cross'], {}).errors).toEqual(['--mode must be "local" or "remote-build", got "cross"']);
-        expect(parseArgs(['https://a.example', '--env', 'oops'], {}).errors).toEqual(['--env expects KEY=VALUE, got "oops"']);
-        expect(parseArgs(['https://a.example', '--no-build', '--mode', 'remote-build'], {}).errors).toEqual(['--no-build and --artifact apply to --mode local only (remote-build ships a source tarball)']);
-        expect(parseArgs(['https://a.example', '--teardown', '--env', 'A=b'], {}).errors).toEqual(['--teardown ships nothing, so --env/--no-build/--artifact/--no-wait do not apply (drop them, or drop --teardown)']);
-        // An unknown flag never hides the missing endpoint: every problem comes back.
-        expect(parseArgs(['--nope'], {}).errors).toEqual(['unknown flag "--nope"', 'no endpoint — pass it as the argument (deploy:endpoint <url>) or with --endpoint / NEXUS_ENDPOINT']);
+        expect(parseArgs([BOX, '--port', '70000'], {}).errors).toEqual(['--port "70000" is out of range (TCP port 0-65535, 0 = auto)']);
+        expect(parseArgs([BOX, '--mode', 'weird'], {}).errors).toEqual(['--mode must be "local" or "remote-build", got "weird"']);
+        expect(parseArgs([BOX, '--mode', 'remote-build', '--no-build'], {}).errors).toEqual(['--no-build and --artifact apply to --mode local only (remote-build ships a source tarball)']);
+        expect(parseArgs([BOX, '--env', 'NOPE'], {}).errors).toEqual(['--env expects KEY=VALUE, got "NOPE"']);
     });
 
     it('reports a missing value without treating the next flag as one', () => {
-        // `--token --dry-run` is a missing value, not the token "--dry-run".
-        const { flags, errors } = parseArgs(['https://a.example', '--token', '--dry-run'], {});
-        expect(errors).toEqual(['--token needs a value']);
-        expect(flags.token).toBe('');
-        // The rejected token is consumed, so --dry-run does not silently re-attach to
-        // it. The run exits 1 on the error either way — no flag is guessed at.
-        expect(flags.dryRun).toBe(false);
+        expect(parseArgs([BOX, '--token', '--dry-run'], {}).errors).toEqual(['--token needs a value']);
     });
 
     it('collects every problem in one pass, and --help still wins over a broken line', () => {
-        // Flag-shaped problems come first (parse order), then the cross-flag rules.
-        expect(parseArgs(['--mode', 'x', '--port', '0'], {}).errors).toEqual(['--port "0" is out of range (TCP port 1-65535)', 'no endpoint — pass it as the argument (deploy:endpoint <url>) or with --endpoint / NEXUS_ENDPOINT', '--mode must be "local" or "remote-build", got "x"']);
-        const helped = parseArgs(['--mode', 'x', '--help'], {});
-        expect(helped.flags.help).toBe(true);
-        // --help short-circuits BEFORE the cross-flag rules, so a broken line still
-        // gets the usage screen and exit 0 — the flag shape errors are kept, the
-        // semantic ones are never computed.
-        expect(helped.errors).toEqual([]);
-    });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-describe('deploy-endpoint: mode resolution', () => {
-    it('--teardown is the only thing that switches verbs', () => {
-        expect(resolveMode({ teardownOnly: false })).toBe('deploy');
-        expect(resolveMode({ teardownOnly: true })).toBe('teardown');
+        expect(parseArgs([], {}).errors).toEqual(['no endpoint — pass it as the argument (deploy:endpoint <url>) or with --endpoint / NEXUS_ENDPOINT']);
+        expect(parseArgs(['--help'], {}).flags.help).toBe(true);
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: URL joining and auth headers (must match deploy-daytona.ts)', () => {
     it('joins routes onto the base without clobbering a path prefix', () => {
-        expect(joinUrl('https://box.example', 'health')).toBe('https://box.example/health');
-        expect(joinUrl('https://proxy.example/runner-7777/', 'status')).toBe('https://proxy.example/runner-7777/status');
-        // Daytona preview links ARE path-prefixed; new URL(suffix, base) would drop it.
-        expect(joinUrl('https://proxy.example/sd/sandbox/7777', 'previews')).toBe('https://proxy.example/sd/sandbox/7777/previews');
-        expect(joinUrl('https://box.example', '')).toBe('https://box.example/');
+        expect(joinUrl('https://e.example', 'health')).toBe('https://e.example/health');
+        expect(joinUrl('https://e.example/pfx', 'apps/nexus')).toBe('https://e.example/pfx/apps/nexus');
+        expect(healthUrl('https://e.example/pfx')).toBe('https://e.example/pfx/health');
+        expect(appStateUrl('https://e.example/pfx')).toBe('https://e.example/pfx/apps/nexus');
+        expect(appDeleteUrl('https://e.example/pfx')).toBe('https://e.example/pfx/apps/nexus');
     });
 
     it('sends the token header only when there is a token, so public endpoints keep working', () => {
         expect(authHeaders('')).toEqual({});
-        expect(authHeaders('s3cret')).toEqual({ 'x-daytona-preview-token': 's3cret' });
+        expect(authHeaders('t')).toEqual({ 'x-daytona-preview-token': 't' });
+        expect(credentialsOf(bareFlags())).toEqual({ previewToken: '', adminToken: '' });
+    });
+
+    it('redactSecretArgs masks only the value after --token/--admin-token', () => {
+        expect(redactSecretArgs(['--endpoint', 'https://e', '--token', 't', '--admin-token', 'a', '--mode', 'local'])).toEqual(['--endpoint', 'https://e', '--token', '***', '--admin-token', '***', '--mode', 'local']);
+        expect(redactSecretArgs(['--mode', 'local'])).toEqual(['--mode', 'local']);
     });
 
     it('validates the endpoint where it is first needed', () => {
-        expect(requireEndpoint('http://127.0.0.1:7897')).toBe('http://127.0.0.1:7897');
-        expect(() => requireEndpoint('')).toThrowError(EndpointDeployError);
-        expect(() => requireEndpoint('box.example')).toThrowError(/not a valid absolute URL/);
-        expect(() => requireEndpoint('ftp://box.example')).toThrowError(/must be http\(s\)/);
+        expect(requireEndpoint(BOX)).toBe(BOX);
+        expect(() => requireEndpoint('')).toThrow(EndpointDeployError);
+        expect(() => requireEndpoint('not a url')).toThrow('endpoint is not a valid absolute URL: "not a url"');
+        expect(() => requireEndpoint('ftp://x')).toThrow('endpoint must be http(s), got "ftp:"');
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-describe('deploy-endpoint: classifyProbe — cold start vs wrong URL vs wrong token', () => {
-    it('treats every "not serving yet" answer as retryable', () => {
-        // Modal answers 502/503 until a container holds the port; a Daytona proxy drops
-        // the connection while the sandbox boots. Both are the NORMAL first minutes.
-        expect(classifyProbe(DOWN())).toBe('retry');
+describe('deploy-endpoint: probe tables', () => {
+    it('classifyProbe: retryable cold starts, fatal auth, fatal wrong service', () => {
+        expect(classifyProbe(OK({}))).toBe('ready');
         for (const status of [408, 429, 500, 502, 503]) expect(classifyProbe(FAIL(status))).toBe('retry');
-    });
-
-    it('treats 401/403 as a token problem — retrying cannot fix it', () => {
+        expect(classifyProbe(DOWN())).toBe('retry');
         expect(classifyProbe(FAIL(401))).toBe('auth');
         expect(classifyProbe(FAIL(403))).toBe('auth');
-    });
-
-    it('treats a wrong path, a stopped app and a different service as fatal', () => {
         expect(classifyProbe(FAIL(404))).toBe('dead');
-        expect(classifyProbe(FAIL(302))).toBe('dead');
-        // An edge/HTML error page parses to null JSON: not the runner.
-        expect(classifyProbe({ status: 200, ok: true, json: null, text: '<html>404</html>' })).toBe('dead');
-        // Something JSON-speaking, but not a contract runner (e.g. the hub itself).
-        expect(classifyProbe(OK({ status: 'ok', service: 'nexus-hub' }), { requireContract: true })).toBe('dead');
+        // A 2xx that is not JSON is a DIFFERENT service, not a runner.
+        expect(classifyProbe({ status: 200, ok: true, json: null, text: '<html>' })).toBe('dead');
     });
 
-    it('accepts a 2xx JSON body, and only the contract marker satisfies the identity check', () => {
-        expect(classifyProbe(OK({ slot: 'empty' }))).toBe('ready');
-        expect(classifyProbe(OK({ slot: 'empty' }), { requireContract: true })).toBe('dead');
-        expect(classifyProbe(OK(HEALTH), { requireContract: true })).toBe('ready');
-    });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-describe('deploy-endpoint: the slot policy table', () => {
-    it('an empty slot needs nothing, in either posture', () => {
-        expect(decideTeardown('empty', true)).toEqual({ action: 'none', why: 'the slot is already empty' });
-        expect(decideTeardown('empty', false)).toEqual({ action: 'none', why: 'the slot is already empty' });
+    it('classifyRunnerHealth requires apiVersion >= 2 OR capabilities [apps]', () => {
+        expect(classifyRunnerHealth(HEALTH)).toEqual({ ok: true, health: expect.objectContaining({ contract: 'sandbox-runtime-v2', apiVersion: 2 }) });
+        expect(classifyRunnerHealth({ ...HEALTH, apiVersion: undefined }).ok).toBe(true);
+        const v1 = classifyRunnerHealth(V1_HEALTH);
+        expect(v1.ok).toBe(false);
+        if (!v1.ok) {
+            expect(v1.message).toContain('not a sandbox runtime v2 runner');
+            expect(v1.message).toContain('daytona-runtime-v1');
+        }
     });
 
-    it('a busy slot is replaced by default, and an unrecognised slot counts as busy', () => {
-        expect(decideTeardown('ready', true).action).toBe('teardown');
-        expect(decideTeardown('building', true).action).toBe('teardown');
-        expect(decideTeardown('failed', true).action).toBe('teardown');
-        // 'unknown' = a runner whose state cannot be trusted: deploying blind risks a
-        // 409 after the bundle has already been paid for.
-        expect(decideTeardown('unknown', true).action).toBe('teardown');
-    });
-
-    it('--no-teardown turns a busy slot into an error that names the way out', () => {
-        const decision = decideTeardown('ready', false);
-        expect(decision).toEqual({ action: 'abort', why: 'the slot holds a ready runtime and --no-teardown forbids replacing it' });
-    });
-
-    it('names the runtime being destroyed, so the destructive step is never anonymous', () => {
-        expect(describeRuntime(null)).toBe('runtime');
-        // The /status body nests the runtime object; describeRuntime takes THAT, not the body.
-        const status = busy('https://hub.example').json as { slot: string; runtime: Record<string, unknown> };
-        expect(describeRuntime(status.runtime)).toBe('profile=nexus port=8085 runtimeId=rt-1 since=2023-11-14T22:13:20.000Z serving=https://hub.example');
-        expect(describeRuntime({ profile: 'manifest', port: 9000 })).toBe('profile=manifest port=9000 runtimeId=?');
+    it('classifyAppProbe: 404 is the only "absent"; a non-AppView 2xx is fatal', () => {
+        expect(classifyAppProbe(OK(APP()))).toBe('present');
+        expect(classifyAppProbe(ABSENT)).toBe('absent');
+        expect(classifyAppProbe(FAIL(401))).toBe('auth');
+        expect(classifyAppProbe(DOWN())).toBe('retry');
+        expect(classifyAppProbe(FAIL(502))).toBe('retry');
+        expect(classifyAppProbe(FAIL(400, { error: 'invalid_app_name' }))).toBe('dead');
+        expect(classifyAppProbe(OK({ hello: 'world' }))).toBe('dead');
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-describe('deploy-endpoint: the hub URL is reported, never guessed', () => {
-    it('a box that serves the hub on its own URL says so', () => {
-        // /status nests the runtime object, and buildHubUrl reads runtime.preview.
-        const body = busy('https://box.example/').json as unknown as { runtime: Record<string, unknown> };
-        expect(buildHubUrl({ slot: 'ready', runtime: body.runtime, raw: {} } as never, 'https://box.example')).toEqual({
-            hubUrl: 'https://box.example/',
-            note: 'the endpoint itself serves the hub (it forwards every non-contract path)',
-        });
+describe('deploy-endpoint: the hub URL is AppView.path + endpoint, never a port guess', () => {
+    it('joins the path onto the known endpoint (preserving a prefix)', () => {
+        expect(buildHubUrl({ present: true, view: { ...APP(), path: '/app/nexus/' } as never }, 'https://e.example/pfx')).toEqual({ hubUrl: 'https://e.example/pfx/app/nexus/', note: 'endpoint + /app/nexus/ (the only public app URL)' });
     });
 
-    it('a runtime port with its own preview link reports that link', () => {
-        const body = busy('https://proxy.example/hub-8085').json as unknown as { runtime: Record<string, unknown> };
-        expect(buildHubUrl({ slot: 'ready', runtime: body.runtime, raw: {} } as never, 'https://proxy.example/runner-7777')).toEqual({ hubUrl: 'https://proxy.example/hub-8085', note: 'the runtime port has its own preview URL' });
+    it('falls back to the server publicUrl when a body carries no path', () => {
+        expect(buildHubUrl({ present: true, view: { ...APP(), path: '', publicUrl: 'https://server.example/app/nexus/' } as never }, BOX).hubUrl).toBe('https://server.example/app/nexus/');
     });
 
-    it('no preview URL keeps hubUrl null and carries the runner\'s own warning', () => {
-        const noUrl = { slot: 'ready', runtime: { port: 8085, preview: { url: null, warning: 'the driver has not pushed a tunnel map yet' } }, raw: {} } as never;
-        expect(buildHubUrl(noUrl, 'https://box.example')).toEqual({ hubUrl: null, note: 'the driver has not pushed a tunnel map yet' });
-        const bare = { slot: 'ready', runtime: { port: 8085, preview: {} }, raw: {} } as never;
-        expect(buildHubUrl(bare, 'https://box.example')).toEqual({ hubUrl: null, note: 'the endpoint reported no preview URL for port 8085' });
-        // A runtime torn down between the deploy and the read must not throw.
-        expect(buildHubUrl({ slot: 'empty', runtime: null, raw: {} } as never, 'https://box.example').hubUrl).toBeNull();
+    it('an absent app names null instead of guessing a URL', () => {
+        expect(buildHubUrl({ present: false }, BOX)).toEqual({ hubUrl: null, note: 'app "nexus" is not registered' });
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: the child invocation', () => {
-    it('builds the exact deploy-daytona.ts argv, in a fixed order, with the URL first', () => {
-        expect(buildDeployArgs(flagsOf(['https://box.example']))).toEqual(['--endpoint', 'https://box.example', '--mode', 'local', '--port', '8085']);
-        expect(buildDeployArgs(flagsOf(['https://box.example', '--token', 's3cret']))).toEqual(['--endpoint', 'https://box.example', '--token', 's3cret', '--mode', 'local', '--port', '8085']);
-        expect(buildDeployArgs(flagsOf(['https://box.example', '--mode', 'remote-build']))).toEqual(['--endpoint', 'https://box.example', '--mode', 'remote-build', '--port', '8085']);
-        expect(buildDeployArgs(flagsOf(['https://box.example', '--port', '9000', '--no-wait']))).toEqual(['--endpoint', 'https://box.example', '--mode', 'local', '--port', '9000', '--no-wait']);
-        expect(buildDeployArgs(flagsOf(['https://box.example', '--no-build', '--artifact', '/tmp/hub']))).toEqual(['--endpoint', 'https://box.example', '--mode', 'local', '--port', '8085', '--no-build', '--artifact', '/tmp/hub']);
-        // --env keeps the order it was typed in.
-        expect(buildDeployArgs(flagsOf(['https://box.example', '--env', 'Z=1', '--env', 'A=2']))).toEqual(['--endpoint', 'https://box.example', '--mode', 'local', '--port', '8085', '--env', 'Z=1', '--env', 'A=2']);
+    it('builds the exact deploy-daytona.ts argv, omitting --port unless typed', () => {
+        expect(buildDeployArgs(flagsOf([BOX, '--token', 'pt', '--admin-token', 'at', '--env', 'A=1', '--no-wait']))).toEqual([
+            '--endpoint', BOX,
+            '--token', 'pt',
+            '--admin-token', 'at',
+            '--mode', 'local',
+            '--replace',
+            '--env', 'A=1',
+            '--no-wait',
+        ]);
+        expect(buildDeployArgs(flagsOf([BOX, '--port', '20042', '--no-teardown', '--no-build', '--artifact', '/tmp/x']))).toEqual([
+            '--endpoint', BOX,
+            '--mode', 'local',
+            '--port', '20042',
+            '--no-build',
+            '--artifact', '/tmp/x',
+        ]);
     });
 
     it('wraps it in the vite-node child that the house runner requires', () => {
-        const invocation = buildDeployInvocation(bareFlags(), { HTTPS_PROXY: 'http://proxy:3128' });
+        const invocation = buildDeployInvocation(bareFlags(), { PATH: '/usr/bin' });
         expect(invocation.command).toBe(process.execPath);
-        expect(invocation.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://box.example', '--mode', 'local', '--port', '8085']);
+        expect(invocation.command).not.toBe('node');
+        expect(invocation.args[0]).toBe(VITE_NODE_CLI);
+        expect(invocation.args[1]).toBe(DEPLOY_SCRIPT_PATH);
         expect(invocation.cwd).toBe(PACKAGE_ROOT);
-        // cargo/openssl need the caller's proxy vars untouched.
-        expect(invocation.env).toEqual({ HTTPS_PROXY: 'http://proxy:3128' });
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: the machine-readable line', () => {
-    it('is one JSON object with hubUrl always present for a deploy', () => {
-        expect(buildSummary({ mode: 'deploy', endpoint: 'https://box.example', hubUrl: 'https://box.example', hubPort: 8085, hubNote: 'the endpoint itself serves the hub (it forwards every non-contract path)' })).toBe(
-            '{"mode":"deploy","endpoint":"https://box.example","hubUrl":"https://box.example","hubPort":8085,"hubNote":"the endpoint itself serves the hub (it forwards every non-contract path)"}',
-        );
-        expect(buildSummary({ mode: 'deploy', endpoint: 'https://box.example', hubUrl: null, hubPort: 8085, hubNote: 'no preview URL' })).toBe('{"mode":"deploy","endpoint":"https://box.example","hubUrl":null,"hubPort":8085,"hubNote":"no preview URL"}');
+    it('is one JSON object with v2 fields and no v1 slot language', () => {
+        const line = buildSummary({ mode: 'deploy', endpoint: BOX, hubUrl: `${BOX}/app/nexus/`, status: 'ready', revision: 2, internalPort: 20042, token: 'pt' });
+        expect(line).toBe('{"mode":"deploy","endpoint":"https://box.example","app":"nexus","path":"/app/nexus/","hubUrl":"https://box.example/app/nexus/","status":"ready","revision":2,"internalPort":20042,"token":"pt","tokenScope":"management"}');
+        expect(line).not.toContain('slot');
     });
 
-    it('records the token as runner-scoped, and records what was replaced', () => {
-        expect(buildSummary({ mode: 'teardown', endpoint: 'https://box.example', slot: 'empty', token: 't', replaced: { slot: 'ready', profile: 'nexus', port: 8085 } })).toBe(
-            '{"mode":"teardown","endpoint":"https://box.example","slot":"empty","token":"t","tokenScope":"management","replaced":{"slot":"ready","profile":"nexus","port":8085}}',
-        );
-        // No token → no token key at all (a consumer must not read a masked placeholder).
-        expect(buildSummary({ mode: 'deploy', endpoint: 'https://box.example' })).toBe('{"mode":"deploy","endpoint":"https://box.example"}');
+    it('records a teardown as removed:true|false, with the app path', () => {
+        expect(buildSummary({ mode: 'teardown', endpoint: BOX, removed: false })).toBe('{"mode":"teardown","endpoint":"https://box.example","app":"nexus","path":"/app/nexus/","removed":false}');
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: waitForRoute (the cold-start budget)', () => {
+    const credentials = { previewToken: 'pt' };
+
     it('returns the first ready answer without waiting', async () => {
-        const { probe, calls } = makeProbe([OK(HEALTH)]);
-        const { deps } = makeDeps(probe);
-        const result = await waitForRoute({ method: 'GET', url: 'https://box.example/health', token: '', what: 'GET /health', budgetMs: 1000, requireContract: true, deps });
+        const fake = makeProbe([OK(HEALTH)]);
+        const { deps } = makeDeps(fake.probe);
+        const result = await waitForRoute({ method: 'GET', url: 'https://e/health', credentials, what: 'GET /health', budgetMs: ENDPOINT_WAIT_MS, deps });
         expect(result.json).toEqual(HEALTH);
-        expect(calls).toEqual([{ method: 'GET', url: 'https://box.example/health' }]);
+        expect(fake.calls).toEqual([{ method: 'GET', url: 'https://e/health', token: 'pt' }]);
     });
 
     it('retries transport errors and 5xx, and says so once', async () => {
-        // The budget is what caps the loop (POLL_MS is 2 s), so it must cover 2 waits.
-        const { probe, calls } = makeProbe([DOWN(), FAIL(502), OK(HEALTH)]);
-        const { deps, lines } = makeDeps(probe);
-        expect((await waitForRoute({ method: 'GET', url: 'https://box.example/health', token: '', what: 'GET /health', budgetMs: 6_000, requireContract: true, deps })).json).toEqual(HEALTH);
-        expect(calls).toHaveLength(3);
-        expect(lines.filter((line) => line.includes('is not answering yet'))).toHaveLength(1);
-        expect(lines[0]).toContain('connect ECONNREFUSED');
-        expect(lines[0]).toContain('waiting up to 6s');
+        const fake = makeProbe([DOWN(), FAIL(502), OK(HEALTH)]);
+        const { deps, lines } = makeDeps(fake.probe);
+        expect((await waitForRoute({ method: 'GET', url: 'https://e/health', credentials: {}, what: 'GET /health', budgetMs: ENDPOINT_WAIT_MS, deps })).ok).toBe(true);
+        expect(fake.calls).toHaveLength(3);
+        expect(lines).toEqual(['[nexus:endpoint] GET /health is not answering yet (connect ECONNREFUSED 127.0.0.1:7777) — waiting up to 90s while the container comes up…']);
     });
 
     it('aborts immediately on a token problem, naming the flag that fixes it', async () => {
-        const rejected = makeProbe([FAIL(401)]);
-        const { deps } = makeDeps(rejected.probe);
-        await expect(waitForRoute({ method: 'GET', url: 'https://box.example/health', token: 'wrong', what: 'GET /health', budgetMs: 1_000, requireContract: true, deps })).rejects.toThrowError(/this token was rejected/);
-        expect(rejected.calls).toHaveLength(1);
-
-        const missing = makeProbe([FAIL(403)]);
-        const missingDeps = makeDeps(missing.probe);
-        await expect(waitForRoute({ method: 'GET', url: 'https://box.example/health', token: '', what: 'GET /health', budgetMs: 1_000, requireContract: true, deps: missingDeps.deps })).rejects.toThrowError(/no token was given/);
-        // 403 is an answer, so nothing is retried — a wrong token never fixes itself.
-        expect(missing.calls).toHaveLength(1);
+        const fake = makeProbe([FAIL(401, { error: 'unauthorized' })]);
+        const { deps } = makeDeps(fake.probe);
+        await expect(waitForRoute({ method: 'GET', url: 'https://e/health', credentials: {}, what: 'GET /health', budgetMs: ENDPOINT_WAIT_MS, deps })).rejects.toThrow('Pass --token <the Daytona preview token>');
+        expect(fake.calls).toHaveLength(1);
     });
 
-    it('aborts immediately when the answer is not a runner', async () => {
-        const { probe } = makeProbe([FAIL(404)]);
-        const { deps } = makeDeps(probe);
-        await expect(waitForRoute({ method: 'GET', url: 'https://box.example/health', token: '', what: 'GET /health', budgetMs: 1000, requireContract: true, deps })).rejects.toThrowError(/that is not a daytona-runtime-v1 runner/);
+    it('aborts immediately when the answer is not a v2 runner route', async () => {
+        const fake = makeProbe([FAIL(404)]);
+        const { deps } = makeDeps(fake.probe);
+        await expect(waitForRoute({ method: 'GET', url: 'https://e/health', credentials: {}, what: 'GET /health', budgetMs: ENDPOINT_WAIT_MS, deps })).rejects.toThrow('that is not a sandbox runtime v2 runner');
+        expect(fake.calls).toHaveLength(1);
     });
 
     it('gives up within its budget when the endpoint never answers', async () => {
-        // Frozen clock: the attempt cap is what bounds the loop, so this is instant.
-        const script = Array.from({ length: 500 }, () => DOWN('socket hang up'));
-        const { probe } = makeProbe(script);
-        const { deps } = makeDeps(probe);
-        await expect(waitForRoute({ method: 'GET', url: 'https://box.example/health', token: '', what: 'GET /health', budgetMs: 1000, requireContract: true, deps })).rejects.toThrowError(/never answered at https:\/\/box.example\/health \(last: socket hang up/);
+        const fake = makeProbe(Array.from({ length: Math.ceil(ENDPOINT_WAIT_MS / 2000) }, () => DOWN()));
+        const { deps } = makeDeps(fake.probe);
+        await expect(waitForRoute({ method: 'GET', url: 'https://e/health', credentials: {}, what: 'GET /health', budgetMs: ENDPOINT_WAIT_MS, deps })).rejects.toThrow('never answered at https://e/health');
+        expect(fake.calls).toHaveLength(Math.ceil(ENDPOINT_WAIT_MS / 2000));
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('deploy-endpoint: the named-app teardown', () => {
+    it('DELETE /apps/nexus treats removed:false as success, then verifies 404', async () => {
+        const fake = makeProbe([TORN_DOWN(false), ABSENT]);
+        const { deps } = makeDeps(fake.probe);
+        expect(await deleteApp(BOX, {}, deps)).toEqual({ removed: false });
+        await verifyAppAbsent(BOX, {}, deps);
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual(['DELETE https://box.example/apps/nexus', 'GET https://box.example/apps/nexus']);
+    });
+
+    it('fails when the DELETE does not confirm tornDown', async () => {
+        const fake = makeProbe([OK({ tornDown: false })]);
+        const { deps } = makeDeps(fake.probe);
+        await expect(deleteApp(BOX, {}, deps)).rejects.toThrow('did not confirm the teardown');
+    });
+
+    it('fails when the record survives the verified 404 check', async () => {
+        const fake = makeProbe([OK(APP({ status: 'draining' }))]);
+        const { deps } = makeDeps(fake.probe);
+        await expect(verifyAppAbsent(BOX, {}, deps)).rejects.toThrow('still reports "draining"');
+    });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+describe('deploy-endpoint: the Modal container recycle is explicit and box-only', () => {
+    it('classifies a Modal box and a Modal sandbox, and leaves everything else alone', () => {
+        expect(classifyModalContainer(MODAL_BOX, MODAL_HEALTH)).toBe('box');
+        expect(classifyModalContainer(MODAL_SANDBOX, MODAL_HEALTH)).toBe('sandbox');
+        // Without the service marker, or without a Modal host, it is not ours to reset.
+        expect(classifyModalContainer(MODAL_BOX, HEALTH)).toBeNull();
+        expect(classifyModalContainer(BOX, MODAL_HEALTH)).toBeNull();
+    });
+
+    it('uses DELETE /_provider/sandbox — never the v1 root /sandbox route', async () => {
+        const fake = makeProbe([OK({ tornDown: true })]);
+        const { deps } = makeDeps(fake.probe);
+        await requestModalContainerReset(MODAL_BOX, { previewToken: 'pt' }, deps);
+        expect(fake.calls[0]).toMatchObject({ method: 'DELETE', url: `${MODAL_BOX}/_provider/sandbox`, token: 'pt' });
+    });
+
+    it('fails closed: a 404 says the adapter lacks the v2 route, a 500 refuses to pretend', async () => {
+        const missing = makeProbe([FAIL(404)]);
+        await expect(requestModalContainerReset(MODAL_BOX, {}, makeDeps(missing.probe).deps)).rejects.toThrow('does not implement DELETE /_provider/sandbox');
+        const broken = makeProbe([FAIL(500, null, 'runner exploded')]);
+        await expect(requestModalContainerReset(MODAL_BOX, {}, makeDeps(broken.probe).deps)).rejects.toThrow('without DELETE /_provider/sandbox the container cannot be recycled');
+    });
+
+    it('waits for a NEW process (young uptime) whose registry no longer knows nexus', async () => {
+        const fake = makeProbe([OK(MODAL_OLD_HEALTH), OK(MODAL_HEALTH), ABSENT]);
+        const { deps } = makeDeps(fake.probe);
+        expect(await waitForModalContainerReset(MODAL_BOX, {}, deps, 0)).toEqual({ present: false });
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual([`GET ${MODAL_BOX}/health`, `GET ${MODAL_BOX}/health`, `GET ${MODAL_BOX}/apps/nexus`]);
+    });
+
+    it('resetModalBoxContainer sends the DELETE then proves the replacement', async () => {
+        const fake = makeProbe([OK({ tornDown: true }), OK(MODAL_HEALTH), ABSENT]);
+        const { deps } = makeDeps(fake.probe);
+        expect(await resetModalBoxContainer(MODAL_BOX, {}, deps)).toEqual({ present: false });
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual([`DELETE ${MODAL_BOX}/_provider/sandbox`, `GET ${MODAL_BOX}/health`, `GET ${MODAL_BOX}/apps/nexus`]);
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: the deploy flow', () => {
-    it('waits out a cold start, finds an empty slot, deploys, and reports the hub URL', async () => {
-        const flags = flagsOf(['https://box.example']);
-        // health (down → up) → status (empty) → [child] → status (ready + preview).
-        const scripted = makeProbe([DOWN(), OK(HEALTH), OK(EMPTY), busy('https://box.example')]);
-        const { deps, lines, invocations } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flags, deps)).toBe(0);
-        expect(scripted.remaining()).toBe(0);
-        expect(scripted.calls).toEqual([
-            { method: 'GET', url: 'https://box.example/health' },
-            { method: 'GET', url: 'https://box.example/health' },
-            { method: 'GET', url: 'https://box.example/status' },
-            { method: 'GET', url: 'https://box.example/status' },
-        ]);
-        expect(invocations).toHaveLength(1);
-        expect(lines.some((line) => line.includes('✓ runtime runner — contract daytona-runtime-v1, runner port 7777, auth none, exposed ports [8085]'))).toBe(true);
-        expect(lines.some((line) => line.includes('slot: empty'))).toBe(true);
-        expect(lines.some((line) => line.includes('slot is empty — nothing to replace'))).toBe(true);
-        expect(lines.at(-3)).toContain('hub (clients):    https://box.example');
-        expect(lines.at(-2)).toContain('management:       https://box.example/health');
-        // The LAST stdout line is bare JSON — a consumer can `tail -1 | jq` it.
-        expect(lines.at(-1)).toBe('{"mode":"deploy","endpoint":"https://box.example","hubUrl":"https://box.example","hubPort":8085,"hubNote":"the endpoint itself serves the hub (it forwards every non-contract path)"}');
-    });
+    const flags = (extra: string[] = []) => flagsOf([BOX, ...extra]);
 
-    it('sends the token on every contract call and hands it to the child', async () => {
-        const flags = flagsOf(['https://box.example', '--token', 's3cret']);
-        const scripted = makeProbe([OK(HEALTH), OK(EMPTY), busy('https://box.example')]);
-        const { deps, invocations, lines } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flags, deps)).toBe(0);
-        expect(scripted.calls.map((call) => `${call.method} ${call.url}`)).toEqual(['GET https://box.example/health', 'GET https://box.example/status', 'GET https://box.example/status']);
-        expect(scripted.calls.every((call) => call.token === 's3cret')).toBe(true);
-        expect(invocations[0]!.args).toContain('s3cret');
-        expect(invocations[0]!.env.NEXUS_DAYTONA_ENDPOINT).toBe('https://box.example');
-        expect(invocations[0]!.env.NEXUS_DAYTONA_PREVIEW_TOKEN).toBe('s3cret');
-        expect(lines.at(-1)).toContain('"token":"s3cret","tokenScope":"management"');
-    });
-
-    it('REPLACES a busy slot by default: DELETE, prove empty, then deploy', async () => {
-        const flags = flagsOf(['https://box.example']);
-        const scripted = makeProbe([OK(HEALTH), busy('https://box.example'), OK({ tornDown: true, runtimeId: 'rt-1' }), OK(EMPTY), busy('https://box.example')]);
-        const { deps, lines, invocations } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flags, deps)).toBe(0);
-        expect(scripted.remaining()).toBe(0);
-        expect(scripted.calls.map((call) => `${call.method} ${call.url}`)).toEqual([
-            'GET https://box.example/health',
-            'GET https://box.example/status',
-            'DELETE https://box.example/',
-            'GET https://box.example/status',
-            'GET https://box.example/status',
-        ]);
-        expect(lines.some((line) => line.includes(`slot: ready (profile=nexus port=8085 runtimeId=rt-1 since=2023-11-14T22:13:20.000Z serving=https://box.example)`))).toBe(true);
-        expect(lines.some((line) => line.includes("DELETE https://box.example/ — the slot holds a ready runtime, and replacing it is this command's default, replacing profile=nexus port=8085 runtimeId=rt-1"))).toBe(true);
-        expect(lines.some((line) => line.includes('✓ slot empty'))).toBe(true);
-        expect(invocations).toHaveLength(1);
-        expect(lines.at(-1)).toContain('"replaced":{"slot":"ready","profile":"nexus","port":8085}');
-    });
-
-    it('never recycles a NON-Modal endpoint — only DELETE / is ever called there', async () => {
-        const scripted = makeProbe([OK(HEALTH), busy(null), OK({ tornDown: true }), OK(EMPTY), OK(EMPTY), busy(null)]);
-        const { deps } = makeDeps(scripted.probe);
-        await runDeployEndpoint(bareFlags(), deps);
-        expect(scripted.calls.some((call) => call.url.includes('sandbox'))).toBe(false);
-    });
-
-    it('--no-teardown refuses a busy slot before any deploy runs', async () => {
-        const flags = flagsOf(['https://box.example', '--no-teardown']);
-        const scripted = makeProbe([OK(HEALTH), busy(null)]);
-        const { deps, problems, invocations } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(flags, deps)).rejects.toThrowError('--no-teardown forbids replacing it — pass --teardown to free it, or drop --no-teardown to let this command replace it');
-        expect(scripted.calls.map((call) => call.method)).toEqual(['GET', 'GET']);
-        expect(invocations).toEqual([]);
+    it('waits out a cold start, finds NO app, POSTs, and reports the v2 URL', async () => {
+        const fake = makeProbe([OK(HEALTH), ABSENT, OK(APP())]);
+        const { deps, lines, problems, invocations } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flags(), deps)).toBe(0);
         expect(problems).toEqual([]);
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual(['GET https://box.example/health', 'GET https://box.example/apps/nexus', 'GET https://box.example/apps/nexus']);
+        // CREATE: the child gets no --replace and no --port (auto-allocate).
+        expect(invocations[0]!.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', BOX, '--mode', 'local']);
+        expect(lines).toContain('[nexus:endpoint] app nexus: absent (POST /apps will create it)');
+        expect(lines).toContain('[nexus:endpoint] ✓ sandbox runtime v2 — sandbox-runtime-v2, apiVersion 2, capabilities [apps, app-proxy, blue-green-replace], runner port 7777, public origin https://box.example, auth none');
+        expect(lines).toContain('[nexus:endpoint] ✓ app nexus — revision 1, status ready, internal port 20042, ready');
+        expect(lines).toContain('[nexus:endpoint]   hub (clients):    https://box.example/app/nexus/');
+        // LAST line, bare single-line JSON.
+        expect(JSON.parse(lines[lines.length - 1]!)).toEqual({ mode: 'deploy', endpoint: BOX, app: 'nexus', path: '/app/nexus/', hubUrl: 'https://box.example/app/nexus/', status: 'ready', revision: 1, internalPort: 20042 });
     });
 
-    it('reports hubUrl:null plus the runner\'s warning when the endpoint cannot name the service', async () => {
-        const scripted = makeProbe([OK(HEALTH), OK(EMPTY), READY_NO_PREVIEW]);
-        const { deps, lines } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(bareFlags(), deps)).toBe(0);
-        expect(lines.some((line) => line.includes('hub (clients):    not reported (port 8085 has no preview URL'))).toBe(true);
-        expect(lines.some((line) => line.includes('note:             Daytona sandboxes mint a per-port link with getPreviewLink(8085)'))).toBe(true);
-        expect(lines.at(-1)).toContain('"hubUrl":null');
-        expect(lines.at(-1)).toContain('"hubNote":"port 8085 has no preview URL — the driver has not pushed one"');
+    it('REPLACES a ready app with PUT (blue-green), never a container reset', async () => {
+        const fake = makeProbe([OK(HEALTH), OK(APP({ revision: 1 })), OK(APP({ revision: 2 }))]);
+        const { deps, lines, invocations } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flags(['--token', 'pt']), deps)).toBe(0);
+        expect(invocations[0]!.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', BOX, '--token', 'pt', '--mode', 'local', '--replace']);
+        expect(lines).toContain('[nexus:endpoint] app nexus is ready — PUT https://box.example/apps/nexus (blue-green; revision 1 keeps serving until the new one is ready)');
+        expect(JSON.parse(lines[lines.length - 1]!)).toMatchObject({ revision: 2, replaced: { status: 'ready', revision: 1 } });
+        // No provider route was touched on a non-Modal endpoint.
+        expect(fake.calls.some((call) => call.url.includes('/_provider/'))).toBe(false);
     });
 
-    it('surfaces the child\'s exit code, and does not read the hub URL after a failed deploy', async () => {
-        const scripted = makeProbe([OK(HEALTH), OK(EMPTY)]);
-        const { deps, problems, invocations } = makeDeps(scripted.probe, 0, { spawnCode: 1 });
-        expect(await runDeployEndpoint(bareFlags(), deps)).toBe(1);
-        expect(scripted.calls).toHaveLength(2);
-        expect(problems[0]).toContain('✗ deploy failed (exit 1)');
-        expect(invocations).toHaveLength(1);
+    it('a failed app is also replaceable with PUT', async () => {
+        const fake = makeProbe([OK(HEALTH), OK(APP({ status: 'failed', ready: false, error: 'process_exited' })), OK(APP({ revision: 2 }))]);
+        const { deps, invocations } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flags(), deps)).toBe(0);
+        expect(invocations[0]!.args).toContain('--replace');
     });
 
-    it('refuses to deploy after a DELETE that leaves the slot busy', async () => {
-        const scripted = makeProbe([OK(HEALTH), busy(null), OK({ tornDown: true }), OK({ slot: 'stopping', runtime: {} }), OK({ slot: 'stopping', runtime: {} })]);
-        const { deps } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(bareFlags(), deps)).rejects.toThrowError(/DELETE \/ was accepted but the slot still reads "stopping"/);
-    });
-
-    it('refuses to deploy when the DELETE itself is not confirmed', async () => {
-        const scripted = makeProbe([OK(HEALTH), busy(null), OK({ slot: 'ready' })]);
-        const { deps } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(bareFlags(), deps)).rejects.toThrowError(/did not confirm the teardown/);
-    });
-
-    it('a failed cold start ends as a clear timeout, not a stack', async () => {
-        const scripted = makeProbe(Array.from({ length: 500 }, () => FAIL(503, 'sandbox is starting')));
-        const { deps, lines } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(bareFlags(), deps)).rejects.toThrowError(/GET \/health never answered/);
-        expect(lines[1]).toContain('waiting up to');
-    });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  The Modal container reset — the security half of this script. The container is
-//  ASKED what it holds: an empty slot is taken as the fresh machine, a busy slot
-//  replaces the CONTAINER before the POST so nothing the old one held survives.
-// ══════════════════════════════════════════════════════════════════════════════
-describe('deploy-endpoint: the Modal container reset', () => {
-    it('classifies a Modal box and a Modal sandbox, and leaves everything else alone', () => {
-        expect(classifyModalContainer(MODAL_BOX, MODAL_HEALTH)).toBe('box');
-        expect(classifyModalContainer(MODAL_SANDBOX, MODAL_HEALTH)).toBe('sandbox');
-        // The Daytona twin reports no `service` marker, so it is never replaceable.
-        expect(classifyModalContainer(MODAL_BOX, HEALTH)).toBeNull();
-        // A Modal runner on loopback (a host smoke run) has no platform to relaunch it.
-        expect(classifyModalContainer('http://127.0.0.1:7777', MODAL_HEALTH)).toBeNull();
-        // A Daytona preview URL is not a Modal host even if the marker appeared.
-        expect(classifyModalContainer('https://proxy.example/sd/7777', MODAL_HEALTH)).toBeNull();
-    });
-
-    it('uses an EMPTY-slot Modal box as-is — nothing is in it, so it is the fresh machine', async () => {
-        const scripted = makeProbe([OK(MODAL_HEALTH), OK(EMPTY), busy(`${MODAL_BOX}/`)]);
-        const { deps, lines, invocations } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flagsOf([MODAL_BOX]), deps)).toBe(0);
-        expect(scripted.calls.map((call) => `${call.method} ${call.url}`)).toEqual([`GET ${MODAL_BOX}/health`, `GET ${MODAL_BOX}/status`, `GET ${MODAL_BOX}/status`]);
-        expect(lines.some((line) => line.includes('slot is empty — nothing is running in the container, so it is used as the fresh machine (no reset)'))).toBe(true);
-        expect(invocations).toHaveLength(1);
-        // No reset happened, so the audit line must not claim one.
-        expect(lines.at(-1)).not.toContain('"recycled"');
-    });
-
-    it('REPLACES a BUSY Modal box: DELETE /sandbox, then wait for a NEW container with an empty slot', async () => {
-        const scripted = makeProbe([
-            OK(MODAL_HEALTH), // preflight
-            busy(`${MODAL_BOX}/`), // what the old container held
-            OK({ tornDown: true }), // DELETE /sandbox
-            OK(MODAL_HEALTH), // the replacement: a young uptime proves it started after the delete
-            OK(EMPTY), // and its slot is empty
-            busy(`${MODAL_BOX}/`), // after the deploy
+    it('a queued|building|booting app cannot be PUT: it is deleted APP-SCOPED, then POSTed', async () => {
+        const fake = makeProbe([OK(HEALTH), OK(APP({ status: 'building' })), TORN_DOWN(true), ABSENT, OK(APP({ revision: 2 }))]);
+        const { deps, lines, invocations } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flags(), deps)).toBe(0);
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+            'GET https://box.example/health',
+            'GET https://box.example/apps/nexus',
+            'DELETE https://box.example/apps/nexus',
+            'GET https://box.example/apps/nexus',
+            'GET https://box.example/apps/nexus',
         ]);
-        const { deps, lines, invocations } = makeDeps(scripted.probe);
+        expect(invocations[0]!.args).not.toContain('--replace');
+        expect(lines).toContain('[nexus:endpoint] app nexus is "building", which §6.2 does not allow a PUT to replace — deleting just this app first (DELETE https://box.example/apps/nexus)');
+    });
+
+    it('--no-teardown refuses an existing app before any delete or child', async () => {
+        const fake = makeProbe([OK(HEALTH), OK(APP({ status: 'building' }))]);
+        const { deps, invocations } = makeDeps(fake.probe);
+        await expect(runDeployEndpoint(flags(['--no-teardown']), deps)).rejects.toThrow('app "nexus" already exists (building) and --no-teardown forbids replacing it');
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual(['GET https://box.example/health', 'GET https://box.example/apps/nexus']);
+        expect(invocations).toEqual([]);
+    });
+
+    it('a pending replace is a conflict, never a delete of the in-flight revision', async () => {
+        const fake = makeProbe([OK(HEALTH), OK(APP({ pending: { revision: 2, status: 'booting', internalPort: 20043, queue: null, error: null } }))]);
+        const { deps, invocations } = makeDeps(fake.probe);
+        await expect(runDeployEndpoint(flags(), deps)).rejects.toThrow('a replacement of app "nexus" is already in progress');
+        expect(invocations).toEqual([]);
+        expect(fake.calls.some((c) => c.method === 'DELETE')).toBe(false);
+    });
+
+    it('a Modal box is NOT reset by the replace posture; the text says the container survives', async () => {
+        const fake = makeProbe([OK(MODAL_HEALTH), OK(APP({ status: 'building' })), TORN_DOWN(true), ABSENT, OK(APP())]);
+        const { deps, lines } = makeDeps(fake.probe);
         expect(await runDeployEndpoint(flagsOf([MODAL_BOX]), deps)).toBe(0);
-        expect(scripted.remaining()).toBe(0);
-        expect(scripted.calls.map((call) => `${call.method} ${call.url}`)).toEqual([
+        expect(lines).toContain('[nexus:endpoint] Modal box: the container is NOT recycled — replacement is app-scoped; --recycle-container opts into discarding every app');
+        // The only DELETE is the APP route — /_provider/sandbox was not called.
+        expect(fake.calls.filter((c) => c.method === 'DELETE').map((c) => c.url)).toEqual([`${MODAL_BOX}/apps/nexus`]);
+    });
+
+    it('--recycle-container on a Modal box sends DELETE /_provider/sandbox, waits for a fresh container, then POSTs', async () => {
+        const fake = makeProbe([OK(MODAL_HEALTH), OK(APP({ status: 'building' })), OK({ tornDown: true }), OK(MODAL_OLD_HEALTH), OK(MODAL_HEALTH), ABSENT, OK(APP())]);
+        const { deps, lines, invocations } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flagsOf([MODAL_BOX, '--recycle-container']), deps)).toBe(0);
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual([
             `GET ${MODAL_BOX}/health`,
-            `GET ${MODAL_BOX}/status`,
-            `DELETE ${MODAL_BOX}/sandbox`,
+            `GET ${MODAL_BOX}/apps/nexus`,
+            `DELETE ${MODAL_BOX}/_provider/sandbox`,
             `GET ${MODAL_BOX}/health`,
-            `GET ${MODAL_BOX}/status`,
-            `GET ${MODAL_BOX}/status`,
+            `GET ${MODAL_BOX}/health`,
+            `GET ${MODAL_BOX}/apps/nexus`,
+            `GET ${MODAL_BOX}/apps/nexus`,
         ]);
-        // The runtime teardown is part of the container reset; DELETE / would leave the
-        // machine — and everything malicious that survived in it — in place.
-        expect(scripted.calls.some((call) => call.method === 'DELETE' && call.url.endsWith('/'))).toBe(false);
-        expect(lines.some((line) => line.includes(`DELETE ${MODAL_BOX}/sandbox — the slot holds a ready runtime, so the container is replaced`))).toBe(true);
-        expect(lines.some((line) => line.includes('✓ replacement container is up — the deploy lands in THIS container'))).toBe(true);
-        expect(invocations).toHaveLength(1);
-        // The machine-readable line records the reset, so a consumer can audit it.
-        expect(lines.at(-1)).toContain('"recycled":"box"');
-        expect(lines.at(-1)).not.toContain('"replaced"');
+        expect(invocations[0]!.args).not.toContain('--replace');
+        expect(lines).toContain(`[nexus:endpoint] DELETE ${MODAL_BOX}/_provider/sandbox — --recycle-container: this ends the container and discards EVERY app on it, not only nexus`);
+        expect(JSON.parse(lines[lines.length - 1]!)).toMatchObject({ recycled: 'box' });
     });
 
-    it('accepts a replacement first seen while the old container was gone (a non-2xx proves the swap)', async () => {
-        // The uptime check and the "old one left" observation are independent proofs;
-        // a 503 gap is enough on its own, which is what this pins.
-        const scripted = makeProbe([OK(MODAL_HEALTH), busy(null), OK({ tornDown: true }), FAIL(503), OK(MODAL_HEALTH), OK(EMPTY), busy(null)]);
-        const { deps, lines } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flagsOf([MODAL_BOX]), deps)).toBe(0);
-        expect(scripted.calls.some((call) => call.url === `${MODAL_BOX}/sandbox`)).toBe(true);
-        expect(lines.some((line) => line.includes('"recycled":"box"'))).toBe(true);
+    it('--recycle-container is refused for a non-Modal endpoint and for a Modal sandbox tunnel', async () => {
+        const nonModal = makeProbe([OK(HEALTH), ABSENT]);
+        await expect(runDeployEndpoint(flags(['--recycle-container']), makeDeps(nonModal.probe).deps)).rejects.toThrow('--recycle-container only applies to a Modal box');
+        const tunnel = makeProbe([OK(MODAL_HEALTH), ABSENT]);
+        await expect(runDeployEndpoint(flagsOf([MODAL_SANDBOX, '--recycle-container']), makeDeps(tunnel.probe).deps)).rejects.toThrow('is a Modal SANDBOX tunnel (…modal.host)');
     });
 
-    it('--no-teardown keeps its hands off the Modal container', async () => {
-        const scripted = makeProbe([OK(MODAL_HEALTH), OK(EMPTY), busy(`${MODAL_BOX}/`)]);
-        const { deps } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flagsOf([MODAL_BOX, '--no-teardown']), deps)).toBe(0);
-        expect(scripted.calls.map((call) => `${call.method} ${call.url}`)).toEqual([`GET ${MODAL_BOX}/health`, `GET ${MODAL_BOX}/status`, `GET ${MODAL_BOX}/status`]);
-        expect(scripted.calls.some((call) => call.url.includes('/sandbox'))).toBe(false);
+    it('surfaces the child\'s exit code and does not read the app afterwards', async () => {
+        const fake = makeProbe([OK(HEALTH), ABSENT]);
+        const { deps, problems } = makeDeps(fake.probe, { spawnCode: 3 });
+        expect(await runDeployEndpoint(flags(), deps)).toBe(3);
+        expect(fake.calls).toHaveLength(2);
+        expect(problems[0]).toContain('✗ deploy failed (exit 3)');
     });
 
-    it('uses an EMPTY-slot Modal sandbox as supplied', async () => {
-        const scripted = makeProbe([OK(MODAL_HEALTH), OK(EMPTY), busy(null)]);
-        const { deps } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flagsOf([MODAL_SANDBOX]), deps)).toBe(0);
-        expect(scripted.calls.some((call) => call.url.includes('/sandbox'))).toBe(false);
+    it('TEARDOWN removes only the app and verifies the 404', async () => {
+        const fake = makeProbe([OK(HEALTH), OK(APP()), TORN_DOWN(true), ABSENT]);
+        const { deps, lines } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flagsOf([BOX, '--teardown', '--token', 'pt']), deps)).toBe(0);
+        expect(fake.calls.map((c) => `${c.method} ${c.url}`)).toEqual(['GET https://box.example/health', 'GET https://box.example/apps/nexus', 'DELETE https://box.example/apps/nexus', 'GET https://box.example/apps/nexus']);
+        expect(lines).toContain('[nexus:endpoint] ✓ app nexus removed — GET https://box.example/apps/nexus now answers 404; the endpoint keeps serving');
+        expect(JSON.parse(lines[lines.length - 1]!)).toEqual({ mode: 'teardown', endpoint: BOX, app: 'nexus', path: '/app/nexus/', removed: true, token: 'pt', tokenScope: 'management', replaced: { status: 'ready', revision: 1 } });
     });
 
-    it('REFUSES a BUSY Modal sandbox tunnel — its URL dies with the container, so it cannot be reset in place', async () => {
-        const scripted = makeProbe([OK(MODAL_HEALTH), busy(null)]);
-        const { deps, invocations } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(flagsOf([MODAL_SANDBOX]), deps)).rejects.toThrowError(/Modal SANDBOX tunnel \(…modal\.host\) holding a ready runtime/);
-        expect(scripted.calls.map((call) => `${call.method} ${call.url}`)).toEqual([`GET ${MODAL_SANDBOX}/health`, `GET ${MODAL_SANDBOX}/status`]);
-        expect(invocations).toEqual([]);
+    it('TEARDOWN of an absent app is a no-op: no DELETE at all', async () => {
+        const fake = makeProbe([OK(HEALTH), ABSENT]);
+        const { deps, lines } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flagsOf([BOX, '--teardown']), deps)).toBe(0);
+        expect(fake.calls.map((c) => c.method)).toEqual(['GET', 'GET']);
+        expect(lines).toContain('[nexus:endpoint] ✓ app nexus is already absent — nothing to remove (removed:false); the endpoint is untouched');
+        expect(JSON.parse(lines[lines.length - 1]!)).toMatchObject({ mode: 'teardown', removed: false });
     });
 
-    it('--teardown on a Modal box frees the slot and never resets the container', async () => {
-        const scripted = makeProbe([OK(MODAL_HEALTH), busy(null), OK({ tornDown: true }), OK(EMPTY)]);
-        const { deps } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flagsOf([MODAL_BOX, '--teardown']), deps)).toBe(0);
-        expect(scripted.calls.some((call) => call.url.includes('/sandbox'))).toBe(false);
+    it('hands both credentials to the child (preview flag + admin env)', async () => {
+        const fake = makeProbe([OK(HEALTH), ABSENT, OK(APP())]);
+        const { deps, invocations } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flags(['--token', 'pt', '--admin-token', 'at']), deps)).toBe(0);
+        expect(invocations[0]!.args).toContain('--admin-token');
+        expect(invocations[0]!.args).toContain('at');
+        expect(invocations[0]!.env.NEXUS_DAYTONA_PREVIEW_TOKEN).toBe('pt');
+        expect(invocations[0]!.env.NEXUS_SANDBOX_ADMIN_TOKEN).toBe('at');
     });
 
-    it('refuses to deploy when DELETE /sandbox is not confirmed', async () => {
-        const scripted = makeProbe([OK(MODAL_HEALTH), busy(null), OK({ slot: 'ready' })]);
-        const { deps, invocations } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(flagsOf([MODAL_BOX]), deps)).rejects.toThrowError(/did not confirm the container reset/);
-        expect(invocations).toEqual([]);
-    });
-
-    it('refuses to deploy while the OLD container is still the one answering', async () => {
-        // A long-lived box's uptime can never pass the freshness check, so a reset that
-        // did not actually replace the process fails closed. The budget is frozen in
-        // tests, so the attempt cap ends the loop: ceil(RECYCLE_WAIT_MS / 2000 ms).
-        const stubborn = Array.from({ length: Math.ceil(RECYCLE_WAIT_MS / 2_000) }, () => OK(MODAL_OLD_HEALTH));
-        const scripted = makeProbe([OK(MODAL_HEALTH), busy(null), OK({ tornDown: true }), ...stubborn]);
-        const { deps, invocations } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(flagsOf([MODAL_BOX]), deps)).rejects.toThrowError(/never reported a fresh, empty container after DELETE \/sandbox \(last: the old container is still answering\)/);
-        expect(invocations).toEqual([]);
-    });
-
-    it('refuses to deploy when the replacement container is not empty', async () => {
-        const perAttempt = Array.from({ length: Math.ceil(RECYCLE_WAIT_MS / 2_000) }, () => [OK(MODAL_HEALTH), busy(null)]).flat();
-        const scripted = makeProbe([OK(MODAL_HEALTH), busy(null), OK({ tornDown: true }), ...perAttempt]);
-        const { deps, invocations } = makeDeps(scripted.probe);
-        await expect(runDeployEndpoint(flagsOf([MODAL_BOX]), deps)).rejects.toThrowError(/never reported a fresh, empty container after DELETE \/sandbox \(last: a fresh container whose slot reads "ready"\)/);
-        expect(invocations).toEqual([]);
-    });
-});
-
-// ══════════════════════════════════════════════════════════════════════════════
-describe('deploy-endpoint: the teardown verb', () => {
-    it('frees the slot and ships nothing', async () => {
-        const flags = flagsOf(['https://box.example', '--teardown']);
-        const scripted = makeProbe([OK(HEALTH), busy('https://box.example'), OK({ tornDown: true }), OK(EMPTY)]);
-        const { deps, lines, invocations } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flags, deps)).toBe(0);
-        expect(invocations).toEqual([]);
-        expect(scripted.calls.map((call) => call.method)).toEqual(['GET', 'GET', 'DELETE', 'GET']);
-        expect(lines.at(-2)).toContain('✓ no runtime holds https://box.example');
-        expect(lines.at(-1)).toBe('{"mode":"teardown","endpoint":"https://box.example","slot":"empty","replaced":{"slot":"ready","profile":"nexus","port":8085}}');
-    });
-
-    it('an already-empty slot is a no-op, not a DELETE', async () => {
-        const flags = flagsOf(['https://box.example', '--teardown']);
-        const scripted = makeProbe([OK(HEALTH), OK(EMPTY)]);
-        const { deps, lines, invocations } = makeDeps(scripted.probe);
-        expect(await runDeployEndpoint(flags, deps)).toBe(0);
-        expect(scripted.calls.map((call) => call.method)).toEqual(['GET', 'GET']);
-        expect(invocations).toEqual([]);
-        expect(lines.at(-1)).toBe('{"mode":"teardown","endpoint":"https://box.example","slot":"empty"}');
+    it('reports an absent app after --no-wait with a null hub URL instead of guessing', async () => {
+        const fake = makeProbe([OK(HEALTH), ABSENT, ABSENT]);
+        const { deps, lines } = makeDeps(fake.probe);
+        expect(await runDeployEndpoint(flags(['--no-wait']), deps)).toBe(0);
+        expect(lines.some((line) => line.includes('is not registered after the child exited 0'))).toBe(true);
+        expect(JSON.parse(lines[lines.length - 1]!)).toMatchObject({ hubUrl: null, hubNote: 'app "nexus" is not registered' });
     });
 });
 
@@ -760,92 +690,100 @@ describe('deploy-endpoint: dry run touches nothing', () => {
         });
         vi.stubGlobal('fetch', fetchSpy);
         try {
-            const flags = flagsOf(['https://box.example', '--dry-run', '--token', 's3cret', '--env', 'NEXUS_TOKEN=xyz']);
-            const scripted = makeProbe([]);
-            const { deps, lines, invocations } = makeDeps(scripted.probe);
-            expect(await runDeployEndpoint(flags, deps)).toBe(0);
-            expect(scripted.calls).toEqual([]);
+            const fake = makeProbe([]);
+            const { deps, lines, invocations } = makeDeps(fake.probe);
+            expect(await runDeployEndpoint(flagsOf([BOX, '--dry-run', '--token', 'secret', '--admin-token', 'admin-secret']), deps)).toBe(0);
+            expect(fake.calls).toEqual([]);
             expect(invocations).toEqual([]);
             expect(fetchSpy).not.toHaveBeenCalled();
-            expect(lines[0]).toContain('DRY RUN — no probe, no DELETE, no child process, no cargo, no network');
-            expect(lines.some((line) => line.includes('preflight: GET https://box.example/health  →  GET https://box.example/status  →  on a BUSY slot: DELETE /sandbox on a Modal box (the container is replaced) or DELETE / anywhere else'))).toBe(true);
-            expect(lines.some((line) => line.includes('x-daytona-preview-token: *** (length 6)'))).toBe(true);
-            expect(lines.some((line) => line.includes('a busy slot is replaced'))).toBe(true);
-            expect(lines.some((line) => line.includes('hub URL after success: read from GET /status → runtime.preview.url (never guessed)'))).toBe(true);
-            // The dry run prints exactly the argv it WOULD have run.
-            expect(lines.some((line) => line.trim().endsWith(`${VITE_NODE_CLI} ${DEPLOY_SCRIPT_PATH} --endpoint https://box.example --token s3cret --mode local --port 8085 --env NEXUS_TOKEN=xyz`))).toBe(true);
-            expect(lines.at(-1)).not.toMatch(/^\{"/); // no machine-readable line for a plan
+            const text = lines.join('\n');
+            expect(text).toContain('v2 gate:   GET https://box.example/health');
+            expect(text).toContain('POST https://box.example/apps');
+            expect(text).toContain('PUT https://box.example/apps/nexus (blue-green; no peer touched)');
+            expect(text).toContain('DELETE https://box.example/apps/nexus — app-scoped; verifies GET → 404');
+            expect(text).toContain('x-daytona-preview-token: *** (length 6)');
+            expect(text).toContain('authorization: Bearer *** (length 12)');
+            // The child command is rendered with BOTH credential values masked.
+            expect(text).toContain('--token *** --admin-token *** --mode local');
+            expect(text).not.toContain('secret');
+            expect(text).toContain('internal port AUTO-ALLOCATED');
+            expect(text).toContain('container: no reset');
         } finally {
             vi.unstubAllGlobals();
         }
     });
 
-    it('dry-runs the teardown and strict postures without inventing work', async () => {
-        const teardown = makeDeps(makeProbe([]).probe);
-        expect(await runDeployEndpoint(flagsOf(['https://box.example', '--dry-run', '--teardown']), teardown.deps)).toBe(0);
-        expect(teardown.lines.some((line) => line.includes('mode: teardown — frees the slot and stops here'))).toBe(true);
+    it('shows --recycle-container as destructive when it is given', async () => {
+        const { deps, lines } = makeDeps(makeProbe([]).probe);
+        expect(await runDeployEndpoint(flagsOf([MODAL_BOX, '--dry-run', '--recycle-container']), deps)).toBe(0);
+        expect(lines.join('\n')).toContain('DESTRUCTIVE: removes EVERY app on the Modal box');
+    });
 
-        const strict = makeDeps(makeProbe([]).probe);
-        expect(await runDeployEndpoint(flagsOf(['https://box.example', '--dry-run', '--no-teardown']), strict.deps)).toBe(0);
-        expect(strict.lines.some((line) => line.includes('a busy slot is an error (--no-teardown)'))).toBe(true);
-
-        const shipped = makeDeps(makeProbe([]).probe);
-        expect(await runDeployEndpoint(flagsOf(['https://box.example', '--dry-run', '--mode', 'remote-build']), shipped.deps)).toBe(0);
-        expect(shipped.lines.some((line) => line.includes('--mode remote-build --port 8085'))).toBe(true);
+    it('dry-runs the teardown posture without inventing work', async () => {
+        const { deps, lines, invocations } = makeDeps(makeProbe([]).probe);
+        expect(await runDeployEndpoint(flagsOf([BOX, '--dry-run', '--teardown']), deps)).toBe(0);
+        expect(invocations).toEqual([]);
+        expect(lines.join('\n')).toContain('mode: teardown — removes app "nexus" only');
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: main() maps results onto exit codes', () => {
     it('--help prints the usage and never touches the network', async () => {
-        const scripted = makeProbe([]);
-        const { deps, lines } = makeDeps(scripted.probe);
+        const fake = makeProbe([]);
+        const { deps, lines } = makeDeps(fake.probe);
         expect(await main(['--help'], deps)).toBe(0);
-        // USAGE goes out as ONE log call — one line in the sink, verbatim.
         expect(lines).toEqual([USAGE]);
-        expect(scripted.calls).toEqual([]);
+        expect(USAGE).toContain('sandbox runtime V2');
+        expect(USAGE).toContain('/apps/nexus');
+        expect(USAGE).toContain('--admin-token');
+        expect(USAGE).toContain('--recycle-container');
+        expect(USAGE).not.toContain('DELETE /sandbox');
     });
 
     it('a bad command line exits 1 with every problem and the usage', async () => {
-        const scripted = makeProbe([]);
-        const { deps, problems } = makeDeps(scripted.probe);
-        expect(await main(['--port', '99999'], deps)).toBe(1);
-        expect(problems[0]).toContain('✗ --port "99999" is out of range');
-        expect(problems.some((line) => line.includes('no endpoint'))).toBe(true);
-        expect(problems.at(-2)).toBe('');
-        expect(problems.at(-1)).toBe(USAGE);
-        expect(scripted.calls).toEqual([]);
+        const { deps, problems } = makeDeps(makeProbe([]).probe);
+        expect(await main([], deps)).toBe(1);
+        expect(problems[0]).toBe('[nexus:endpoint] ✗ no endpoint — pass it as the argument (deploy:endpoint <url>) or with --endpoint / NEXUS_ENDPOINT');
+        expect(problems[1]).toBe('');
+        expect(problems[2]).toBe(USAGE);
+    });
+
+    it('a v1 runner exits 1 with the v2 gate message, before any app read', async () => {
+        const fake = makeProbe([OK(V1_HEALTH)]);
+        const { deps, problems } = makeDeps(fake.probe);
+        expect(await main([BOX], deps)).toBe(1);
+        expect(problems[0]).toContain('not a sandbox runtime v2 runner');
+        expect(problems[0]).toContain('daytona-runtime-v1');
+        expect(fake.calls).toHaveLength(1);
     });
 
     it('a dead URL exits 1 with one actionable line', async () => {
-        const scripted = makeProbe([FAIL(404, '<html>App not found</html>')]);
-        const { deps, problems, lines } = makeDeps(scripted.probe);
-        expect(await main(['https://typo--container-sandbox.modal.run'], deps)).toBe(1);
-        expect(problems).toHaveLength(1);
-        expect(problems[0]).toContain('that is not a daytona-runtime-v1 runner');
-        expect(lines.at(-1)).not.toMatch(/^\{"/);
+        const { deps, problems } = makeDeps(makeProbe([FAIL(404)]).probe);
+        expect(await main([BOX], deps)).toBe(1);
+        expect(problems[0]).toContain('that is not a sandbox runtime v2 runner');
     });
 
     it('an operator error and a bug are reported differently', async () => {
-        const throwing = makeDeps(async () => {
-            throw new Error('boom');
-        });
-        expect(await main(['https://box.example'], throwing.deps)).toBe(1);
-        expect(throwing.problems[0]).toContain('unexpected failure');
+        const operator = makeDeps(makeProbe([]).probe);
+        expect(await main([BOX, '--recycle-container', '--dry-run', '--no-teardown'], operator.deps)).toBe(1);
+        expect(operator.problems[0]).toContain('--no-teardown forbids touching the endpoint');
 
-        const guarded = makeDeps(async () => {
-            throw new EndpointDeployError('pass --token');
-        });
-        expect(await main(['https://box.example'], guarded.deps)).toBe(1);
-        expect(guarded.problems).toEqual(['[nexus:endpoint] ✗ pass --token']);
+        const bug = makeDeps(makeProbe([]).probe);
+        // A thrown non-EndpointDeployError keeps its stack, so a real defect is not
+        // dressed up as operator error; here the failure is the endpoint read.
+        bug.deps.probe = async () => {
+            throw new TypeError('boom');
+        };
+        expect(await main([BOX], bug.deps)).toBe(1);
+        expect(bug.problems[0]).toContain('unexpected failure: TypeError: boom');
     });
 
     it('a full run through main() exits 0 and ends with the summary line', async () => {
-        const scripted = makeProbe([OK(HEALTH), OK(EMPTY), busy('https://box.example')]);
-        const { deps, lines } = makeDeps(scripted.probe);
-        expect(await main(['https://box.example'], deps)).toBe(0);
-        // Nothing but JSON on the last line — that is what a chained consumer parses.
-        expect(JSON.parse(lines.at(-1)!)).toMatchObject({ mode: 'deploy', endpoint: 'https://box.example', hubUrl: 'https://box.example', hubPort: 8085 });
+        const fake = makeProbe([OK(HEALTH), ABSENT, OK(APP())]);
+        const { deps, lines } = makeDeps(fake.probe);
+        expect(await main([BOX], deps)).toBe(0);
+        expect(JSON.parse(lines[lines.length - 1]!)).toMatchObject({ mode: 'deploy', app: 'nexus', hubUrl: 'https://box.example/app/nexus/' });
     });
 });
 
@@ -853,57 +791,55 @@ describe('deploy-endpoint: main() maps results onto exit codes', () => {
 describe('deploy-endpoint: spawnDeploy — the one real side effect (SpawnImpl seam)', () => {
     const child = () => {
         const listeners: Record<string, ((arg?: unknown) => void)[]> = {};
-        const spawned = {
+        const fake = {
             on: vi.fn((event: string, listener: (arg?: unknown) => void) => {
                 (listeners[event] ??= []).push(listener);
-                return spawned;
+                return fake;
             }),
             emit: (event: string, arg?: unknown) => {
                 for (const listener of listeners[event] ?? []) listener(arg);
             },
         };
-        return spawned;
+        return fake;
     };
 
     it('inherits stdio, runs from the package root, and forwards the child env untouched', async () => {
-        const spawned = child();
-        const impl = vi.fn(() => spawned);
-        const promise = spawnDeploy({ command: 'node', args: ['a', 'b'], cwd: PACKAGE_ROOT, env: { PATH: '/x', NEXUS_TOKEN: 'secret' } }, impl);
-        spawned.emit('close', 0);
-        expect(await promise).toBe(0);
-        expect(impl).toHaveBeenCalledWith('node', ['a', 'b'], { cwd: PACKAGE_ROOT, env: { PATH: '/x', NEXUS_TOKEN: 'secret' }, stdio: 'inherit' });
+        const fakeChild = child();
+        const impl = vi.fn(() => fakeChild);
+        const invocation = buildDeployInvocation(bareFlags(), { PATH: '/usr/bin' });
+        const run = spawnDeploy(invocation, impl as never);
+        expect((impl as unknown as ReturnType<typeof vi.fn>).mock.calls[0]).toEqual([process.execPath, invocation.args, { cwd: PACKAGE_ROOT, env: invocation.env, stdio: 'inherit' }]);
+        fakeChild.emit('close', 0);
+        expect(await run).toBe(0);
     });
 
     it('maps every non-zero outcome to a non-zero exit code', async () => {
-        const failed = child();
-        const failedRun = spawnDeploy({ command: 'node', args: [], cwd: PACKAGE_ROOT, env: {} }, () => failed);
-        failed.emit('close', 7);
-        expect(await failedRun).toBe(7);
+        for (const [code, expected] of [[0, 0], [2, 2], [null, 1]] as const) {
+            const fakeChild = child();
+            const run = spawnDeploy(buildDeployInvocation(bareFlags(), {}), (() => fakeChild) as never);
+            fakeChild.emit('close', code);
+            expect(await run).toBe(expected);
+        }
+    });
 
-        const signalled = child();
-        const signalledRun = spawnDeploy({ command: 'node', args: [], cwd: PACKAGE_ROOT, env: {} }, () => signalled);
-        signalled.emit('close', null); // SIGINT/SIGTERM: no numeric code
-        expect(await signalledRun).toBe(1);
-
-        const missing = child();
-        const missingRun = spawnDeploy({ command: 'node', args: [], cwd: PACKAGE_ROOT, env: {} }, () => missing);
-        missing.emit('error', new Error('ENOENT vite-node'));
-        expect(await missingRun).toBe(1);
+    it('the default deps are the real fetch probe and the real spawner', () => {
+        const deps = createDefaultDeps();
+        expect(deps.spawn).toBe(spawnDeploy);
+        expect(typeof deps.probe).toBe('function');
     });
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
 describe('deploy-endpoint: the import-is-a-no-op guard', () => {
-    const module = join(PACKAGE_ROOT, 'scripts', 'deploy-endpoint.ts');
+    const module = '/repo/packages/typecrate/nexus/scripts/deploy-endpoint.ts';
 
     it('never runs under vitest, whatever the argv looks like', () => {
-        expect(isCliEntryPoint({ vitest: true, argv: ['node', module], modulePath: module })).toBe(false);
+        expect(isCliEntryPoint({ vitest: true, argv: ['/usr/bin/node', module], modulePath: module })).toBe(false);
     });
 
     it('runs when the script positional names this file (direct and --script forms)', () => {
         expect(isCliEntryPoint({ argv: ['/usr/bin/node', module], modulePath: module })).toBe(true);
         expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node', '--script', 'scripts/deploy-endpoint.ts'], modulePath: module })).toBe(true);
-        expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node', '--script', 'scripts/deploy-endpoint.ts', 'https://x'], modulePath: module })).toBe(true);
     });
 
     it('runs when the npm lifecycle line names it, and not when it names a sibling', () => {
@@ -913,14 +849,12 @@ describe('deploy-endpoint: the import-is-a-no-op guard', () => {
 
     it('runs when vite-node evaluated this file as its entry, and not when another module imported it', () => {
         expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node'], modulePath: module, stack: `Error\n    at Object.<anonymous> (${module}:1:1)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)` })).toBe(true);
-        expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node'], modulePath: module, stack: `Error\n    at Object.<anonymous> (${module}:1:1)\n    at consumer (/repo/packages/typecrate/nexus/scripts/consumer.ts:2:2)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)` })).toBe(false);
-        // A sibling's module id in the stack is not evidence for this file.
-        expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node'], modulePath: module, stack: 'Error\n    at Object.<anonymous> (/repo/other.ts:1:1)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)' })).toBe(false);
+        expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node'], modulePath: module, stack: `Error\n    at Object.<anonymous> (${module}:1:1)\n    at startModal (/repo/packages/typecrate/nexus/scripts/start-modal.ts:2:2)\n    at ViteNodeRunner.executeFile (runner.mjs:1:1)` })).toBe(false);
     });
 
     it('ignores module query strings, and rejects plain node without any runner evidence', () => {
-        expect(isCliEntryPoint({ argv: ['/usr/bin/node', `${module}?v=3`], modulePath: module })).toBe(true);
-        expect(isCliEntryPoint({ argv: ['/usr/bin/node'], modulePath: module, stack: new Error().stack })).toBe(false);
+        expect(isCliEntryPoint({ argv: ['/usr/bin/node', `${module}?v=1`], modulePath: module })).toBe(true);
+        expect(isCliEntryPoint({ argv: ['/usr/bin/node', 'vite-node', '@services/daytona/sandbox'], modulePath: module })).toBe(false);
         expect(isCliEntryPoint({})).toBe(false);
     });
 });

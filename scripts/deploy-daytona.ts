@@ -1,50 +1,73 @@
-// Compile @typecrate/nexus and boot it on a Daytona sandbox runtime endpoint.
+// Compile @typecrate/nexus and deploy it as the NAMED app `nexus` on a sandbox
+// runtime v2 runner (services/daytona/sandbox-specs.md).
 //
-// WHAT THIS DOES (R3 of the daytona runtime work):
+// WHAT THIS DOES:
 //   cargo build → ONE single-file bundle (`nexus-hub`, a stripped static-ish ELF)
-//   → POST it to the sandbox runner → the runner stages/boots it → we poll
-//   `/status` until `ready`. The sandbox owns the lifecycle; this script only
-//   ships bytes and waits.
+//   → POST it to `POST /apps` with `x-app-name: nexus` → the runner stages,
+//   boots and probes it → we poll `GET /apps/nexus` until `ready`. The sandbox
+//   owns the lifecycle; this script only ships bytes and waits.
 //
-// THE ENDPOINT CONTRACT (v1, frozen — the sandbox implements exactly this):
-//   POST   /        body = raw bundle bytes (application/octet-stream) or JSON
-//                   { profile, config?, bundleBase64, filename? }
-//                   202 while accepted into the single runtime slot,
-//                   409 { error: "runtime_active", slot } when the slot is busy
-//   GET    /status  { slot, runtime?: { profile, port, pid, ready, … } }
-//   GET    /logs    text/plain tail of the build+run log
-//   DELETE /        idempotent teardown → { tornDown: true }
+// THE v2 ENDPOINT CONTRACT (normative: services/daytona/sandbox-specs.md):
+//   POST   /apps              binary form: body = raw bundle bytes
+//                             (application/octet-stream) + `x-app-name: nexus`,
+//                             optional `x-runtime-profile`, `x-runtime-config`
+//                             (base64url JSON) and `x-runtime-filename`.
+//                             202 {accepted:true, app: AppView(status queued)}.
+//   PUT    /apps/nexus        blue-green replace (--replace). Same headers/body;
+//                             legal only while the app is ready|failed (§6.3).
+//                             202 {accepted:true, app: <current>, pending: {...}}.
+//   GET    /apps/nexus        the AppView (§5.2/§7.6). Poll this, NEVER /status:
+//                             /status is the v1 alias for the app named `default`
+//                             and reports "empty" for every named app (§7.11).
+//   GET    /apps/nexus/logs   text/plain tail (§7.10) after a failure.
+//   DELETE /apps/nexus        idempotent named teardown (§6.4/§7.8):
+//                             200 {tornDown:true,name,removed:true|false}.
+//                             `removed:false` means the name was already absent
+//                             and is a SUCCESS, not a 404.
 //   AUTH: a private Daytona preview URL authenticates ONLY through the request
-//   header `x-daytona-preview-token` (no query param, no URL-embedded secret),
-//   so --token / NEXUS_DAYTONA_PREVIEW_TOKEN is sent on POST, GET /status,
-//   GET /logs and DELETE alike. Without it the proxy answers 401/403 before the
-//   runner ever sees the profile headers.
-//   The slot is single-runtime: empty → staging → building → booting →
-//   ready | failed, and even `failed` holds the slot until DELETE. Hence
-//   a 409 here means "someone (maybe a previous run of this script) already
-//   owns the sandbox" — we tell the user to pass --teardown, we never
-//   auto-teardown, because silently killing a running hub is worse than an
-//   extra flag.
+//   header `x-daytona-preview-token` (no query param, no URL-embedded secret), so
+//   --token / NEXUS_DAYTONA_PREVIEW_TOKEN is sent on every request. The runner's
+//   OPTIONAL admin credential (§12.3) is a SEPARATE Bearer — --admin-token /
+//   NEXUS_SANDBOX_ADMIN_TOKEN / SANDBOX_ADMIN_TOKEN — sent alongside it when the
+//   runner has SANDBOX_ADMIN_TOKEN set; it authorizes mutations and log reads.
+//   Without it the preview proxy still answers 401/403 before the runner sees
+//   anything.
+//
+// THE APP IS A NAMED REGISTRY ENTRY, NOT A SLOT:
+//   `POST /apps` is create-only and answers 409 app_exists when `nexus` is already
+//   registered (in ANY state, including failed). This script NEVER tears anything
+//   down implicitly — silently killing a running hub is worse than one extra flag.
+//   The two explicit verbs are:
+//     --replace    PUT /apps/nexus (blue-green; the old revision keeps serving
+//                  until the new one is ready). Only legal for ready|failed.
+//     --teardown   DELETE /apps/nexus (the sandbox itself keeps running).
+//   A 409 app_not_replaceable (queued/building/booting/draining) or
+//   replace_in_progress is explained with the exact next step, never retried
+//   blind.
+//
+// PORT: the internal port is AUTO-ALLOCATED by the runner (§6.2 step 4) unless
+//   the operator explicitly asks for one with --port. v2 removed the v1 profile
+//   defaults (8085/8080), and the internal port never appears in a public URL:
+//   clients use `<origin>/app/nexus/` (§4.1/§4.2, P-7/P-8). Omitting `config.port`
+//   is what lets the runner pick a free loopback port for this app.
 //
 // TWO MODES:
-//   --mode local         compile HERE, ship the binary. Zero sandbox build
-//                        time, and it honours "nexus always builds correctly
-//                        for a cargo/rust script that can execute anywhere".
-//                        Risk: this dev host may not reach index.crates.io
-//                        without an HTTPS proxy (README "Verification status")
-//                        — that is a real failure we report, not hide.
-//   --mode remote-build  ship the SOURCE as a tar.gz and let the sandbox run
-//                        cargo (manifest profile). Slower, but independent of
-//                        host registry access.
+//   --mode local         compile HERE, ship the binary. Zero sandbox build time.
+//   --mode remote-build  ship the SOURCE as a tar.gz and let the sandbox run cargo
+//                        (manifest profile). Slower, but independent of host
+//                        registry access. The manifest profile does NOT get the
+//                        nexus profile's runner-injected NEXUS_LISTEN (§8.6), so
+//                        its runCmd supplies NEXUS_LISTEN=127.0.0.1:$PORT itself
+//                        (bash -lc expands the runner-injected PORT, §9.4).
 //
-// GENERICITY: the bundle + profile + config are the only nexus-specific
-// things here; the profile/config blocks below are what a future script type
-// would swap out. Everything else (args, POST, 409 handling, polling) is
-// copy-paste generic — deliberately NOT built into a framework, since nexus is
-// the only wired profile today.
+// GENERICITY: the bundle + profile + config are the only nexus-specific things
+// here; everything else (args, upload, 409 handling, polling) is copy-paste
+// generic — deliberately NOT built into a framework, since nexus is the only
+// wired profile today.
 //
 // RUN VIA: `yarn deploy:daytona --endpoint https://…` (package.json).
-// Zero dependencies: node:fs, node:path, node:child_process, built-in fetch.
+// Zero npm dependencies: node:fs, node:path, node:child_process, built-in fetch,
+// and the colocated sandbox-contract.ts (pure constants/helpers, no I/O).
 // Scratch output (the source tarball) goes in the repo-root `Temp/` folder per
 // AGENTS.md — never OS temp, never inside the nexus package (nested git repo).
 import { execFileSync, spawnSync } from "node:child_process";
@@ -54,6 +77,27 @@ import type { SpawnSyncReturns } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+    APP_LOGS_ROUTE,
+    APP_NAME,
+    APP_PATH,
+    APP_ROUTE,
+    APPS_ROUTE,
+    V1_CONTRACT,
+    describeAppView,
+    describeErrorBody,
+    describeHealth,
+    errorCode,
+    errorDetails,
+    isV2Runner,
+    joinUrl,
+    parseAppView,
+    parseHealth,
+    requestHeaders,
+    resolveAppUrl,
+    secretPlanLine,
+} from "./sandbox-contract";
+import type { AppView, RunnerHealth } from "./sandbox-contract";
 
 const here = dirname(fileURLToPath(import.meta.url));
 // packages/typecrate/nexus — cargo runs from here so the repo-root
@@ -68,28 +112,33 @@ const pkgRoot = resolve(here, "..");
 // nexus checkout has neither, which the candidate list below accounts for.
 const workspaceRoot = resolve(pkgRoot, "..", "..", "..");
 
-const BIN_NAME = "nexus-hub";
-const PROFILE_NEXUS = "nexus";
-const PROFILE_MANIFEST = "manifest";
-const DEFAULT_PORT = 8085;
+export const BIN_NAME = "nexus-hub";
+export const PROFILE_NEXUS = "nexus";
+export const PROFILE_MANIFEST = "manifest";
 // Cap waits: local is just a proxy upload + process boot; remote-build pays a
 // full in-sandbox cargo build (fat LTO), which is minutes-to-decades slow.
-const WAIT_CAP_MS = { [PROFILE_NEXUS]: 6 * 60_000, [PROFILE_MANIFEST]: 40 * 60_000 };
-const POLL_INTERVAL_MS = 2_000;
-// C4: consecutive /status TRANSPORT misses tolerated before giving up. A
-// Daytona preview proxy blips (TLS resets, 502 during deploys) while the
-// runtime keeps booting, so one reset must not abort a 40-minute build wait;
-// 5 consecutive misses (~10 s) is a dead endpoint and stays fatal.
-const POLL_TRANSIENT_MAX = 5;
+export const WAIT_CAP_MS = { [PROFILE_NEXUS]: 6 * 60_000, [PROFILE_MANIFEST]: 40 * 60_000 };
+/** The profile's readiness cap, including for a profile string widened to `string`. */
+export const waitCapMs = (profile: string): number => WAIT_CAP_MS[profile as keyof typeof WAIT_CAP_MS] ?? WAIT_CAP_MS[PROFILE_NEXUS];
+export const POLL_INTERVAL_MS = 2_000;
+// C4: consecutive GET /apps/nexus TRANSPORT misses tolerated before giving up. A
+// Daytona preview proxy blips (TLS resets, 502 during deploys) while the runtime
+// keeps booting, so one reset must not abort a 40-minute build wait; 5
+// consecutive misses (~10 s) is a dead endpoint and stays fatal.
+export const POLL_TRANSIENT_MAX = 5;
 // Scratch tarball location (repo-root Temp/, git-ignored, disposable).
 const tempDir = join(workspaceRoot, "Temp", "nexus-deploy");
 const srcTarball = join(tempDir, "nexus-src.tar.gz");
 // Directories that must never ride along in the source tarball: VCS state,
 // host-built artifacts (Windows ELF/DLL/PDB here), wasm glue, deps, scratch.
-const tarExcludes = [".git", "frontend", "target", "pkg", "node_modules", "Temp"];
+// `.rust` is the host cargo target/cache dir (4.6 GiB on this host, measured into
+// an 874 MB tarball — over the runner's 512 MiB bundle cap, so remote-build would
+// 413 body_too_large). `.turbo`/`var` are the local run cache and the hub's
+// NEXUS_ARTIFACT_ROOT spill; all four are git-ignored and never source.
+export const TAR_EXCLUDES = [".git", ".rust", ".turbo", "var", "frontend", "target", "pkg", "node_modules", "Temp"];
 
-const log = (message: string) => console.log(`>>> ${message}`);
-const ok = (message: string) => console.log(`✓ ${message}`);
+export const log = (message: string) => console.log(`>>> ${message}`);
+export const ok = (message: string) => console.log(`✓ ${message}`);
 // Same `[nexus:…]` prefix the sibling build-wasm.ts uses for failures, so
 // script output is greppable across the package.
 function die(message: string, hint?: string): never {
@@ -98,21 +147,33 @@ function die(message: string, hint?: string): never {
     process.exit(1);
 }
 
-const usage = `usage: yarn deploy:daytona [flags]  (= vite-node scripts/deploy-daytona.ts)
+export const USAGE = `usage: yarn deploy:daytona [flags]  (= vite-node scripts/deploy-daytona.ts)
 
-  --endpoint <url>   sandbox runner endpoint (env NEXUS_DAYTONA_ENDPOINT)
+  ships the nexus bundle to a sandbox runtime V2 runner and registers it as the
+  app "${APP_NAME}" (POST /apps); the sandbox then serves it at ${APP_PATH}.
+
+  --endpoint <url>   sandbox runner endpoint / runner origin (env NEXUS_DAYTONA_ENDPOINT)
   --token <t>        Daytona preview token, sent as the x-daytona-preview-token
                      header on EVERY request (env NEXUS_DAYTONA_PREVIEW_TOKEN)
+  --admin-token <t>  the runner's admin bearer (env NEXUS_SANDBOX_ADMIN_TOKEN, then
+                     SANDBOX_ADMIN_TOKEN); sent as Authorization: Bearer alongside
+                     the preview header, and NEVER printed
   --mode <mode>      local (default: compile here, ship the nexus-hub binary)
                      remote-build (ship a source tarball, cargo runs in-sandbox)
-  --port <n>         port the hub listens on inside the sandbox (default ${DEFAULT_PORT})
+  --port <n>         OPTIONAL internal loopback port for the app; when omitted (the
+                     default) the runner AUTO-ALLOCATES one. Never public: clients
+                     always use ${APP_PATH}
   --env K=V          extra env var for the runtime; repeatable
   --no-build         local mode only: skip cargo and ship an existing artifact
                      from the candidate locations (dies if none exists)
   --artifact <path>  local mode only: ship exactly this file, skip cargo
                      (implies --no-build); must be a Linux ELF binary
-  --no-wait          return after the 202 accepted instead of polling /status
-  --teardown         DELETE / instead of posting (stop the active runtime)
+  --replace          PUT /apps/${APP_NAME} (blue-green replace) instead of POST /apps.
+                     Legal only while the app is ready or failed; the current
+                     revision keeps serving until the new one is ready.
+  --teardown         DELETE /apps/${APP_NAME} instead of uploading (the SANDBOX is
+                     not deleted; an already-absent app is still success)
+  --no-wait          return after the 202 accepted instead of polling GET /apps/${APP_NAME}
   --dry-run          print the exact plan/request; no cargo, no network, no writes
   -h, --help         this text
 
@@ -121,49 +182,79 @@ examples:
   yarn deploy:daytona --mode remote-build --endpoint https://proxy.example/abc --token <preview-token>
   yarn deploy:daytona --no-build --token <preview-token>            # ship the already-built nexus-hub
   yarn deploy:daytona --artifact .rust/target/release/nexus-hub --token <preview-token>
+  yarn deploy:daytona --replace --endpoint https://proxy.example/abc --token <preview-token>
   yarn deploy:daytona --teardown --endpoint https://proxy.example/abc --token <preview-token>`;
 
 // ── args ────────────────────────────────────────────────────────────────────
+/** The flag record parseArgs produces; the plan printers and builders read it through this. */
+export type DeployArgs = {
+    endpoint: string;
+    /** '' = send no preview header (public endpoint / loopback stub). */
+    token: string;
+    /** '' = send no Authorization header (runner auth disabled). */
+    adminToken: string;
+    mode: "local" | "remote-build";
+    /** undefined = let the runner auto-allocate (§6.2 step 4); --port 0 means the same. */
+    port: number | undefined;
+    env: Record<string, string>;
+    wait: boolean;
+    noBuild: boolean;
+    artifact: string;
+    teardown: boolean;
+    replace: boolean;
+    dryRun: boolean;
+    help: boolean;
+};
+
 /**
- * Parses the flat flag list. `--env` is repeatable and accumulates into a
- * plain object; K=V splits on the FIRST "=" so values may contain "=" (e.g.
- * base64 or `KEY=a=b`). Unknown/missing-value flags are fatal with usage.
- * The secret-bearing flags (--token) fall back to env vars so a CI wrapper can
+ * Parses the flat flag list. `--env` is repeatable and accumulates into a plain
+ * object; K=V splits on the FIRST "=" so values may contain "=" (e.g. base64 or
+ * `KEY=a=b`). Unknown/missing-value flags are fatal with usage. The secret-bearing
+ * flags (`--token`, `--admin-token`) fall back to env vars so a CI wrapper can
  * inject them without putting the secret in the visible command line.
  */
-function parseArgs(argv: string[]) {
-    const out = {
+export function parseArgs(argv: string[]): DeployArgs {
+    const out: DeployArgs = {
         endpoint: process.env.NEXUS_DAYTONA_ENDPOINT ?? "",
         // C1: preview token; empty string means "send no auth header" (public
         // endpoint / loopback stub), which is a supported configuration.
         token: process.env.NEXUS_DAYTONA_PREVIEW_TOKEN ?? "",
+        // §12.3: the separate runner admin credential, optional. `||` (not `??`) so
+        // an empty nexus-specific variable falls through to the generic name.
+        adminToken: process.env.NEXUS_SANDBOX_ADMIN_TOKEN || process.env.SANDBOX_ADMIN_TOKEN || "",
         mode: "local",
-        port: DEFAULT_PORT,
-        env: {} as Record<string, string>,
+        // v2 §8.3: absent = auto; the v1 8085 default is deliberately gone.
+        port: undefined,
+        env: {},
         wait: true,
-        // C2: build-skip switches, local mode only (validated after --mode).
         noBuild: false,
         artifact: "",
         teardown: false,
+        replace: false,
         dryRun: false,
         help: false,
     };
     for (let i = 0; i < argv.length; i++) {
-        const flag = argv[i];
+        const flag = argv[i]!;
         // Flags that all take a following value share this branch so the
         // "missing value" failure stays worded identically for each.
-        if (flag === "--endpoint" || flag === "--mode" || flag === "--port" || flag === "--env" || flag === "--token" || flag === "--artifact") {
+        if (flag === "--endpoint" || flag === "--mode" || flag === "--port" || flag === "--env" || flag === "--token" || flag === "--admin-token" || flag === "--artifact") {
             const value = argv[++i];
-            if (value === undefined || value.startsWith("--")) die(`${flag} needs a value`, usage);
+            if (value === undefined || value.startsWith("--")) die(`${flag} needs a value`, USAGE);
             if (flag === "--endpoint") out.endpoint = value;
             else if (flag === "--token") out.token = value;
+            else if (flag === "--admin-token") out.adminToken = value;
             else if (flag === "--artifact") out.artifact = value;
-            else if (flag === "--mode") out.mode = value;
-            else if (flag === "--port") out.port = Number(value);
-            else {
+            else if (flag === "--mode") out.mode = value as DeployArgs["mode"];
+            else if (flag === "--port") {
+                // §8.3: integer 0..65535; 0 is the explicit spelling of "auto".
+                const port = Number(value);
+                if (!Number.isInteger(port) || port < 0 || port > 65535) die(`--port must be an integer 0-65535 (0 = auto), got "${value}"`, USAGE);
+                out.port = port === 0 ? undefined : port;
+            } else {
                 // K=V: reject an empty key; allow empty value and "=" in value.
                 const eq = value.indexOf("=");
-                if (eq <= 0) die(`--env expects KEY=VALUE, got "${value}"`, usage);
+                if (eq <= 0) die(`--env expects KEY=VALUE, got "${value}"`, USAGE);
                 out.env[value.slice(0, eq)] = value.slice(eq + 1);
             }
             continue;
@@ -172,35 +263,35 @@ function parseArgs(argv: string[]) {
         else if (flag === "--no-wait") out.wait = false;
         else if (flag === "--no-build") out.noBuild = true;
         else if (flag === "--teardown") out.teardown = true;
+        else if (flag === "--replace") out.replace = true;
         else if (flag === "--dry-run") out.dryRun = true;
         else if (flag === "-h" || flag === "--help") out.help = true;
-        else die(`unknown flag "${flag}"`, usage);
+        else die(`unknown flag "${flag}"`, USAGE);
     }
     if (out.help) return out;
     if (out.mode !== "local" && out.mode !== "remote-build") {
-        die(`--mode must be "local" or "remote-build", got "${out.mode}"`, usage);
+        die(`--mode must be "local" or "remote-build", got "${out.mode}"`, USAGE);
     }
     // --no-build/--artifact pick which LOCAL bundle to ship; remote-build ships
     // a source tarball, so accepting them there would be a silent no-op and an
     // operator would believe a build (or an artifact) was skipped/used.
     if (out.mode !== "local" && (out.noBuild || out.artifact)) {
-        die(`--no-build and --artifact apply to --mode local only (remote-build ships a source tarball)`, usage);
+        die(`--no-build and --artifact apply to --mode local only (remote-build ships a source tarball)`, USAGE);
     }
-    // Integer port in range; the sandbox binds 0.0.0.0:<port> verbatim.
-    if (!Number.isInteger(out.port) || out.port < 1 || out.port > 65535) {
-        die(`--port must be an integer 1-65535, got "${out.port}"`, usage);
-    }
+    // --teardown and --replace are different verbs; accepting both would leave
+    // the operator guessing which one won.
+    if (out.teardown && out.replace) die(`--teardown and --replace are different verbs — pick one`, USAGE);
     return out;
 }
 
 /**
- * Validates the endpoint for the paths that actually need it (post/teardown).
- * Preview proxies hand out absolute URLs with paths, so trailing-slash joining
- * is done by joinUrl rather than assuming the endpoint is host-rooted.
+ * Validates the endpoint for the paths that actually need it (health/upload/
+ * teardown). Preview proxies hand out absolute URLs with paths, so trailing-slash
+ * joining is done by joinUrl rather than assuming the endpoint is host-rooted.
  */
-function requireEndpoint(endpoint: string): string {
+export function requireEndpoint(endpoint: string): string {
     if (!endpoint) {
-        die("no endpoint — pass --endpoint <url> or set NEXUS_DAYTONA_ENDPOINT", usage);
+        die("no endpoint — pass --endpoint <url> or set NEXUS_DAYTONA_ENDPOINT", USAGE);
     }
     let url;
     try {
@@ -215,28 +306,12 @@ function requireEndpoint(endpoint: string): string {
 }
 
 // ── small helpers ───────────────────────────────────────────────────────────
-const bytes = (n: number) => `${n.toLocaleString("en-US")} bytes (${(n / 1024 / 1024).toFixed(2)} MiB)`;
-const pretty = (value: unknown) => JSON.stringify(value, null, 2);
+export const bytes = (n: number) => `${n.toLocaleString("en-US")} bytes (${(n / 1024 / 1024).toFixed(2)} MiB)`;
+export const pretty = (value: unknown) => JSON.stringify(value, null, 2);
 /** base64url (RFC 4648 §5) — the header form the contract expects. */
-const b64url = (value: unknown) => Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+export const b64url = (value: unknown) => Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
 /** Promise wrapper for the poll cadence (no dependency on node:timers). */
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-/**
- * C1: Daytona private preview URLs authenticate ONLY via this header (query
- * params and URL-embedded secrets are ignored by the proxy). Empty token →
- * no header at all, which keeps public endpoints and the loopback stub working.
- */
-const authHeaders = (token: string): Record<string, string> => (token ? { "x-daytona-preview-token": token } : {});
-/** C1: dry-run/plan rendering — presence and length are shown, the value is not. */
-const maskToken = (token: string) => (token ? `*** (length ${token.length})` : "(not sent — no --token / NEXUS_DAYTONA_PREVIEW_TOKEN)");
-const authPlanLine = (token: string) =>
-    `  x-daytona-preview-token: ${maskToken(token)}${token ? "  ← sent on POST, GET /status, GET /logs and DELETE" : ""}`;
-/** Base-relative join that keeps a proxy's path prefix (no root-path clobbering). */
-function joinUrl(base: string, suffix: string) {
-    const url = new URL(base);
-    url.pathname = `${url.pathname.endsWith("/") ? url.pathname : `${url.pathname}/`}${suffix}`;
-    return url.toString();
-}
+export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** size/existence probe used by both the plan print and the real build path. */
 function probe(path: string) {
     if (!existsSync(path)) return { path, exists: false, size: 0 };
@@ -246,9 +321,92 @@ function probe(path: string) {
 
 /** The artifact descriptor `probe` reports (path + is-it-a-file + size). */
 type Probed = ReturnType<typeof probe>;
+
+// ── app request shape (v2) ──────────────────────────────────────────────────
+
+/** The uploaded profile: the nexus binary, or the in-sandbox cargo build. */
+export const profileFor = (args: Pick<DeployArgs, "mode">): string => (args.mode === "local" ? PROFILE_NEXUS : PROFILE_MANIFEST);
+
+/**
+ * The `x-runtime-config` payload (§8.3 allowed keys only).
+ *
+ * The nexus profile gets `{port?, env}`; the manifest profile gets the v1 build
+ * recipe plus a runCmd that supplies `NEXUS_LISTEN`. WHY the runCmd prefix:
+ * the runner injects NEXUS_LISTEN only for the `nexus` profile (§8.6), and the
+ * nexus server otherwise defaults to 127.0.0.1:8085 — which is no longer the
+ * allocated port now that v2 auto-allocates. `bash -lc` expands the
+ * runner-injected `PORT` (§9.4) before exec, so the server binds exactly the
+ * port the gateway routes to. NEXUS_LISTEN stays a RESERVED user env key for the
+ * nexus profile (R-8.3); it is only ever set here inside the manifest runCmd,
+ * never smuggled through `config.env`.
+ *
+ * `port` is included ONLY when the operator explicitly asked for one: absent
+ * means auto (§8.3, v2 change). Sending `port: 8085` would make every app pin a
+ * port that may already be taken by a peer or a Daytona reserved port.
+ */
+export function buildAppConfig(args: DeployArgs): Record<string, unknown> {
+    const env = args.env;
+    const port = args.port === undefined ? {} : { port: args.port };
+    if (args.mode === "local") {
+        // nexus profile: port + extra env. anonymous:true is a sandbox default, so
+        // it is only worth overriding if a caller wants it.
+        return { ...port, env };
+    }
+    // manifest profile: build inside the sandbox, then run the artifact it
+    // produced. `runCmd` is extraction-dir relative, and `./target` is right
+    // there because the tarball has no repo-root .cargo/config.toml (so no
+    // .rust/target remap).
+    //
+    // NO `artifactPath`: §8.2 chmods it to 0755 right after STAGING, before
+    // `buildCmd` runs (runtime.rs: stage_bundle at :231, run_build_step at :233,
+    // the chmod at :341-366), so naming the not-yet-built target/release/nexus-hub
+    // fails the app with `artifactPath "..." not found in stage dir` and the build
+    // never starts. The cargo output is already executable, and `runCmd` names it.
+    // (A prebuilt artifact is uploaded in --mode local, where filename is chmodded.)
+    return {
+        buildCmd: "cargo build --release --locked -p nexus-server",
+        buildTimeoutSec: 1800,
+        runCmd: `NEXUS_LISTEN=127.0.0.1:$PORT ./target/release/${BIN_NAME}`,
+        env,
+        ...port,
+        probePath: "/v1/observe",
+        probeTimeoutSec: 60,
+        stopSignal: "SIGINT",
+    };
+}
+
+/** Where the upload goes: create (`POST /apps`) or blue-green replace (`PUT /apps/nexus`). */
+export const uploadUrl = (endpoint: string, replace: boolean): string => joinUrl(endpoint, replace ? APP_ROUTE : APPS_ROUTE);
+/** Where the app state is read: `GET /apps/nexus`, never the v1 `/status` alias. */
+export const appStateUrl = (endpoint: string): string => joinUrl(endpoint, APP_ROUTE);
+/** Where the app is deleted: `DELETE /apps/nexus`, never the v1 root `DELETE /`. */
+export const appTeardownUrl = (endpoint: string): string => joinUrl(endpoint, APP_ROUTE);
+/** Where the app log tail is read after a failure. */
+export const appLogsUrl = (endpoint: string, lines: number): string => `${joinUrl(endpoint, APP_LOGS_ROUTE)}?lines=${lines}`;
+/** Where the runner's contract/version is read before any v2 operation. */
+export const healthUrl = (endpoint: string): string => joinUrl(endpoint, "health");
+
+/** The exact upload headers (binary form, §7.5) — also what the dry run prints. */
+export function buildUploadHeaders(args: DeployArgs, config: Record<string, unknown>, filename: string): Record<string, string> {
+    return {
+        "content-type": "application/octet-stream",
+        // §7.5: the app name is a header in binary form and the registry key.
+        "x-app-name": APP_NAME,
+        "x-runtime-profile": profileFor(args),
+        // base64url so the header stays ASCII/JSON-safe.
+        "x-runtime-config": b64url(config),
+        "x-runtime-filename": filename,
+        ...requestHeaders({ previewToken: args.token, adminToken: args.adminToken }),
+    };
+}
+
+/** The two credentials one request carries; the poll loop and logs read pass this. */
+export type Credentials = { previewToken?: string; adminToken?: string };
+
+/** Normalises the flag record into the credential pair every request needs. */
+export const credentialsOf = (args: Pick<DeployArgs, "token" | "adminToken">): Credentials => ({ previewToken: args.token, adminToken: args.adminToken });
+
 // ── artifact location ───────────────────────────────────────────────────────
-/** The flag record parseArgs produces; the plan printers read it through this. */
-type DeployArgs = ReturnType<typeof parseArgs>;
 /**
  * C3 format guard. The sandbox execs the bundle verbatim, so it must be a
  * native Linux ELF. A host-built Windows PE POSTs fine (202) and then fails at
@@ -304,7 +462,7 @@ function assertElf(found: Probed): Probed {
  *   - standalone nexus checkout: no such config → ./target/release/nexus-hub
  * The build path prefers cargo's own JSON output over guessing either one.
  */
-const artifactCandidates = () => [
+export const artifactCandidates = () => [
     join(workspaceRoot, ".rust", "target", "release", BIN_NAME),
     join(pkgRoot, "target", "release", BIN_NAME),
 ];
@@ -420,7 +578,7 @@ function artifactFromCargoJson(run: SpawnSyncReturns<string>) {
  *   otherwise         → compile, trust cargo's reported path, then candidates
  * Every returned path has passed the ELF format guard (C3).
  */
-function resolveArtifact(args: DeployArgs) {
+function resolveArtifact(args: DeployArgs): Probed {
     if (args.artifact) {
         const path = resolve(args.artifact);
         const found = probe(path);
@@ -434,13 +592,13 @@ function resolveArtifact(args: DeployArgs) {
         return assertElf(found);
     }
     // cargo's reported path first, then the two guessed locations as fallbacks.
-    let fromCargo = null;
+    let fromCargo: string | null = null;
     if (args.noBuild) {
         log("--no-build: cargo skipped; looking for an existing artifact instead");
     } else {
         fromCargo = artifactFromCargoJson(buildLocally());
     }
-    const candidates = [fromCargo, ...artifactCandidates()].filter(Boolean);
+    const candidates = [fromCargo, ...artifactCandidates()].filter((candidate): candidate is string => Boolean(candidate));
     for (const c of candidates) {
         const found = probe(c);
         if (found.exists && found.size > 0) {
@@ -463,12 +621,12 @@ function resolveArtifact(args: DeployArgs) {
  * unpacks to a fresh dir, so its cargo writes to ./target (no repo-root
  * .cargo/config.toml exists inside the tarball).
  */
-function buildSourceTarball() {
+function buildSourceTarball(): Probed {
     mkdirSync(tempDir, { recursive: true });
     const args = ["-czf", srcTarball];
-    for (const pattern of tarExcludes) args.push(`--exclude=${pattern}`);
+    for (const pattern of TAR_EXCLUDES) args.push(`--exclude=${pattern}`);
     args.push("-C", pkgRoot, ".");
-    log(`tar ${tarExcludes.map((e) => `--exclude=${e}`).join(" ")} ${pkgRoot} → ${srcTarball}`);
+    log(`tar ${TAR_EXCLUDES.map((e) => `--exclude=${e}`).join(" ")} ${pkgRoot} → ${srcTarball}`);
     try {
         execFileSync("tar", args, { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
     } catch (error) {
@@ -492,17 +650,19 @@ function buildSourceTarball() {
  * fetch + JSON parse with a body dump on non-2xx: a preview proxy returning
  * HTML (502/404) is otherwise an opaque "Unexpected token <" JSON error.
  *
- * `options.soft` (C4, poll loop only) turns a TRANSPORT failure into a
+ * `options.soft` (poll loop only) turns a TRANSPORT failure into a
  * `{ networkError }` result instead of exiting, so the caller can tolerate a
  * proxy blip. It deliberately does NOT cover HTTP statuses — those are the
  * runner answering, which is a real answer.
  */
 /** fetch init plus this script's two own knobs (`timeoutMs`, and C4 `soft`). */
-type RequestOptions = RequestInit & { timeoutMs?: number; soft?: boolean };
+export type RequestOptions = RequestInit & { timeoutMs?: number; soft?: boolean };
 /** Normalised fetch answer: status, parsed JSON when the body was JSON, and
  *  `networkError` only when `soft` turned a transport failure into a value. */
-type RequestResult = { status: number; json: any; text: string; ok: boolean; networkError?: string };
-async function request(method: string, url: string, options: RequestOptions = {}): Promise<RequestResult> {
+export type RequestResult = { status: number; json: any; text: string; ok: boolean; networkError?: string };
+/** The injectable HTTP seam: the real fetch here, a scripted list in a test. */
+export type RequestFn = (method: string, url: string, options?: RequestOptions) => Promise<RequestResult>;
+export async function request(method: string, url: string, options: RequestOptions = {}): Promise<RequestResult> {
     // `timeoutMs` and `soft` are ours, never part of fetch's init.
     const { timeoutMs, soft, ...init } = options;
     let response: Response;
@@ -513,8 +673,8 @@ async function request(method: string, url: string, options: RequestOptions = {}
     } catch (error) {
         const message = (error as { message?: string })?.message ?? String(error);
         if (soft) return { status: 0, json: null, text: "", ok: false, networkError: message };
-        // A POST that timed out here may already have been ACCEPTED, so callers
-        // must not retry it — the single slot would answer 409 to the retry.
+        // An upload that timed out here may already have been ACCEPTED, so callers
+        // must not retry it — the registry would answer 409 app_exists to the retry.
         die(`${method} ${url} failed: ${message}`, "is the endpoint reachable and the Daytona preview proxy up?");
     }
     // Reading the body is inside the same timeout window, so a proxy that
@@ -539,97 +699,276 @@ async function request(method: string, url: string, options: RequestOptions = {}
     return { status: response.status, json, text, ok: true };
 }
 
-/** POSTs a raw bundle with the profile/config/filename headers (+ auth, C1). */
-function postBundle(
-    endpoint: string,
-    { profile, config, filename, body, token }: { profile: string; config: unknown; filename: string; body: Buffer; token: string },
-) {
-    return request("POST", joinUrl(endpoint, ""), {
-        headers: {
-            "content-type": "application/octet-stream",
-            "x-runtime-profile": profile,
-            // base64url so the header stays ASCII/JSON-safe.
-            "x-runtime-config": b64url(config),
-            "x-runtime-filename": filename,
-            // C1: the preview proxy rejects unauthenticated traffic before the
-            // runner sees anything, so the bundle upload needs the token too.
-            ...authHeaders(token),
-        },
-        body: body as BodyInit,
-        // A 3+ MiB binary through a preview proxy is slower than a GET.
-        timeoutMs: 120_000,
-    });
+/** The v2 gate's verdict — a union so a test can pin the refusal without exiting. */
+export type V2Gate = { ok: true; health: RunnerHealth } | { ok: false; message: string; hint: string };
+
+/**
+ * Refuses to run any v2 verb against a runner that is not v2 (§17.1: a v2 client
+ * MUST require apiVersion >= 2 or the `apps` capability). This is a DIFFERENT
+ * error from deploy-daytona's old v1 single-slot contract, and it is what stops
+ * a confusing `404 not_found` on `POST /apps` from being reported as a bundle
+ * problem. No auth is required on /health (§7.2), but the preview header is sent
+ * anyway: the Daytona edge gates every route, /health included.
+ */
+export async function readV2Gate(endpoint: string, credentials: Credentials, requestImpl: RequestFn = request): Promise<V2Gate> {
+    const res = await requestImpl("GET", healthUrl(endpoint), { headers: requestHeaders(credentials), timeoutMs: 15_000 });
+    if (!res.ok) {
+        return { ok: false, message: `GET /health returned ${describeErrorBody(res)}`, hint: "is this the runner origin, and is the Daytona preview proxy up?" };
+    }
+    const health = parseHealth(res.json);
+    if (!isV2Runner(health)) {
+        return {
+            ok: false,
+            message: `this endpoint is not a sandbox runtime v2 runner — ${describeHealth(health)}`,
+            hint:
+                `deploy:daytona registers the app "${APP_NAME}" at ${APP_PATH}, which needs /apps. ` +
+                `A ${V1_CONTRACT} single-slot runner cannot host it; update the sandbox runner (services/daytona/sandbox/runtime-server).`,
+        };
+    }
+    return { ok: true, health };
+}
+
+/** The gate as main uses it: a refusal is a clean exit 1 with the fix on stderr. */
+async function requireV2Runner(endpoint: string, credentials: Credentials, requestImpl: RequestFn): Promise<void> {
+    const gate = await readV2Gate(endpoint, credentials, requestImpl);
+    if (!gate.ok) die(gate.message, gate.hint);
+}
+
+// ── upload outcome + failure explanations (pure) ────────────────────────────
+
+/** What a create/replace was accepted as: the target revision the poll waits for. */
+export type UploadOutcome =
+    | { accepted: true; view: AppView | null; operation: "create" | "replace"; targetRevision: number | null }
+    | { accepted: false; reason: string };
+
+/**
+ * Reads a 202 body (§7.5 create / §7.7 replace). A create's target revision is
+ * the accepted app's revision; a replace's is the PENDING revision, because the
+ * current app deliberately keeps its old revision while the pending one boots.
+ * Anything other than 202 is a failure: the contract only vouches for a bundle
+ * once it has been stored and queued.
+ */
+export function readUploadOutcome(res: RequestResult, operation: "create" | "replace"): UploadOutcome {
+    if (res.status !== 202) return { accepted: false, reason: explainUploadFailure(res, operation) };
+    if (!res.ok) return { accepted: false, reason: explainUploadFailure(res, operation) };
+    const body = (res.json ?? {}) as { accepted?: unknown; app?: unknown; pending?: unknown };
+    if (body.accepted !== true) {
+        return { accepted: false, reason: `HTTP ${res.status} did not confirm the app was accepted: ${pretty(res.json ?? res.text.slice(0, 300))}` };
+    }
+    const view = parseAppView(body.app);
+    if (operation === "replace") {
+        // §7.7: a replace 202 carries `pending`, and `pending.revision` is the revision
+        // to wait for. Without it the poll cannot tell the old current revision from the
+        // replacement, and the old "ok:true with targetRevision null" made polling report
+        // the still-serving current app as success. Treat it as a malformed acceptance:
+        // the replacement may be running, but this client cannot verify it.
+        const pending = (body.pending ?? null) as { revision?: unknown } | null;
+        const pendingRevision = pending && Number.isInteger(Number(pending.revision)) ? Number(pending.revision) : null;
+        if (pendingRevision === null) {
+            return {
+                accepted: false,
+                // The raw response was already printed by main(); keep the reason
+                // stable and body-independent (a `{}`, a null and a string revision
+                // are the same defect to the operator).
+                reason: `HTTP 202 accepted the replacement but reported no numeric pending.revision — cannot identify the revision to wait for, and the still-current revision is never success`,
+            };
+        }
+        return { accepted: true, view, operation, targetRevision: pendingRevision };
+    }
+    return { accepted: true, view, operation, targetRevision: view?.revision ?? null };
 }
 
 /**
- * Polls /status every 2 s until ready/failed or the profile-specific cap.
- * Prints only slot transitions (plus a heartbeat every 10 polls) so a 40-minute
- * in-sandbox cargo build does not drown the terminal.
- *
- * C1: every poll carries the preview token — the proxy guards /status exactly
- * like POST /.
- * C4: TRANSPORT failures are tolerated up to POLL_TRANSIENT_MAX consecutive
- * misses (the run keeps going, the overall cap still bounds it); an HTTP error
- * from the runner is a real answer and stays fatal, and the persistent-miss
- * path returns false so main() exits non-zero.
+ * The 409 table of §19 in operator words. Every branch says what to DO next:
+ *   · app_exists          → --replace or --teardown
+ *   · app_not_replaceable → --replace only accepts ready|failed; --teardown first
+ *   · replace_in_progress → wait for the pending revision to settle
+ *   · reserved/in-use port→ drop --port (auto) or pick another
+ *   · unauthorized        → the admin Bearer, which is a different token from
+ *                           the Daytona preview token
+ * Everything else keeps the runner's own code + details.
  */
-async function pollUntilReady(endpoint: string, capMs: number, token: string) {
-    const deadline = Date.now() + capMs;
-    let lastSlot = "";
+export function explainUploadFailure(res: RequestResult, operation: "create" | "replace"): string {
+    const code = errorCode(res.json);
+    const details = errorDetails(res.json);
+    switch (code) {
+        case "app_exists":
+            return `app "${APP_NAME}" already exists — re-run with --replace (blue-green PUT /apps/${APP_NAME}) or --teardown, then deploy again`;
+        case "app_not_replaceable":
+            return `app "${APP_NAME}" is "${String(details.status ?? "not ready or failed")}" — --replace only accepts a ready or failed app; run --teardown first, then deploy again`;
+        case "replace_in_progress":
+            return `a replacement of app "${APP_NAME}" is already in progress — poll GET /apps/${APP_NAME} until pending is null, then retry`;
+        case "replace_failed":
+            return `the blue-green replacement failed — the current revision is still serving; read GET /apps/${APP_NAME} → lastReplaceError, then fix and retry`;
+        case "reserved_port":
+        case "port_in_use":
+        case "port_exhausted":
+            return `${describeErrorBody(res)} — either drop --port (the runner auto-allocates, the v2 default) or pick a free non-reserved port`;
+        case "runtime_limit":
+            return `${describeErrorBody(res)} — the sandbox is at its app cap; delete an app first (DELETE /apps/<name>)`;
+        case "staging_busy":
+        case "build_queue_full":
+            return `${describeErrorBody(res)} — the runner is busy; retry shortly`;
+        case "unauthorized":
+            return `${describeErrorBody(res)} — this runner has SANDBOX_ADMIN_TOKEN set: pass --admin-token (or set NEXUS_SANDBOX_ADMIN_TOKEN). It is not the Daytona preview token`;
+        case "app_not_found":
+            return operation === "replace"
+                ? `app "${APP_NAME}" does not exist — --replace needs an existing app; drop --replace to create it`
+                : `${describeErrorBody(res)} — the registry does not know the app after it was accepted`;
+        default:
+            return describeErrorBody(res);
+    }
+}
+
+/**
+ * Reads a DELETE answer (§6.4/§7.8). Success is `tornDown:true` in EITHER
+ * `removed` state: `removed:false` means the name was already absent, which is
+ * the idempotent behaviour the contract promises — not a 404 and not an error.
+ */
+export function readTeardownOutcome(res: RequestResult): { ok: true; removed: boolean } | { ok: false; reason: string } {
+    if (!res.ok) return { ok: false, reason: describeErrorBody(res) };
+    const body = (res.json ?? {}) as { tornDown?: unknown; removed?: unknown };
+    if (body.tornDown !== true) {
+        return { ok: false, reason: `DELETE /apps/${APP_NAME} did not confirm the teardown: ${pretty(res.json ?? res.text.slice(0, 300))}` };
+    }
+    return { ok: true, removed: body.removed === true };
+}
+
+// ── poll state machine ──────────────────────────────────────────────────────
+
+/** What the poll is waiting for: a create's revision, or a replace's pending one. */
+export type PollTarget = { operation: "create" | "replace"; revision: number | null };
+
+/** The poll's verdict: a ready AppView, or a failure carrying the last view/reason. */
+export type PollOutcome = { ok: true; view: AppView } | { ok: false; view?: AppView; reason: string };
+
+/**
+ * Polls `GET /apps/nexus` every 2 s until the target revision is ready or the
+ * profile-specific cap. Prints only state transitions (plus a heartbeat every 10
+ * polls) so a 40-minute in-sandbox cargo build does not drown the terminal.
+ *
+ * THE REPLACE TRAP: during a blue-green PUT the CURRENT app keeps reporting
+ * `status:"ready"` the whole time, so a naive "ready means done" test would pass
+ * before the replacement even booted. The target revision is the PENDING one
+ * from the 202 body; success needs that revision to be current. Failure is the
+ * pending disappearing while the current revision is still the old one — that
+ * is the only way §6.3 removes a failed pending.
+ *
+ * C1: every poll carries the preview token (and the admin Bearer when given) —
+ * the proxy guards /apps exactly like the upload.
+ * C4: TRANSPORT failures are tolerated up to POLL_TRANSIENT_MAX consecutive
+ * misses; an HTTP error from the runner is a real answer and returns a reason.
+ */
+export async function pollAppUntilReady(input: {
+    endpoint: string;
+    credentials: Credentials;
+    target: PollTarget;
+    capMs: number;
+    requestImpl?: RequestFn;
+    sleepImpl?: (ms: number) => Promise<void>;
+    logImpl?: (line: string) => void;
+    errorImpl?: (line: string) => void;
+}): Promise<PollOutcome> {
+    const requestImpl = input.requestImpl ?? request;
+    const sleepImpl = input.sleepImpl ?? sleep;
+    const logImpl = input.logImpl ?? log;
+    const errorImpl = input.errorImpl ?? ((line: string) => console.error(line));
+    const deadline = Date.now() + input.capMs;
+    let lastKey = "";
     let tick = 0;
     let misses = 0;
+    const targetRevision = input.target.revision;
     while (Date.now() < deadline) {
-        const res = await request("GET", joinUrl(endpoint, "status"), {
-            headers: authHeaders(token),
+        const res = await requestImpl("GET", appStateUrl(input.endpoint), {
+            headers: requestHeaders(input.credentials),
             soft: true,
             timeoutMs: 15_000,
         });
         if (res.networkError) {
             // `>` not `>=`: 5 misses are tolerated, the 6th in a row ends it.
             if (++misses > POLL_TRANSIENT_MAX) {
-                console.error(`✗ /status failed ${misses} times in a row — giving up: ${res.networkError}`);
-                return false;
+                return { ok: false, reason: `GET /apps/${APP_NAME} failed ${misses} times in a row — giving up: ${res.networkError}` };
             }
-            log(`/status fetch failed (${res.networkError}) — transient miss ${misses}/${POLL_TRANSIENT_MAX}, the runtime may still be booting`);
-            await sleep(POLL_INTERVAL_MS);
+            logImpl(`GET /apps/${APP_NAME} fetch failed (${res.networkError}) — transient miss ${misses}/${POLL_TRANSIENT_MAX}, the app may still be booting`);
+            await sleepImpl(POLL_INTERVAL_MS);
             continue;
         }
         // A successful round trip (any status) proves the endpoint is alive.
         misses = 0;
-        if (!res.ok) die(`/status returned ${res.status}`, (res.text ?? "").slice(0, 400));
-        const slot = res.json?.slot ?? "unknown";
-        if (slot !== lastSlot) {
-            log(`slot: ${slot}${res.json?.runtime ? ` (port ${res.json.runtime.port}, ready=${!!res.json.runtime.ready})` : ""}`);
-            lastSlot = slot;
+        // The app disappeared while we polled: another actor deleted it. Retrying
+        // cannot bring it back, and a silent "ready" would be a lie.
+        if (res.status === 404) {
+            return { ok: false, reason: `GET /apps/${APP_NAME} returned 404 — the app disappeared while polling (deleted elsewhere?)` };
         }
-        if (slot === "ready" && res.json?.runtime?.ready) {
-            ok(`runtime ready — profile ${res.json.runtime.profile}, port ${res.json.runtime.port}`);
-            console.log(pretty(res.json));
-            return true;
+        if (!res.ok) return { ok: false, reason: `GET /apps/${APP_NAME} returned ${describeErrorBody(res)}` };
+        const view = parseAppView(res.json);
+        if (!view) return { ok: false, reason: `GET /apps/${APP_NAME} returned a body that is not an AppView: ${(res.text ?? "").slice(0, 300)}` };
+        const pendingKey = view.pending ? `${view.pending.revision ?? "?"}:${view.pending.status}` : "-";
+        const key = `${view.revision ?? "?"}:${view.status}:${pendingKey}`;
+        if (key !== lastKey) {
+            logImpl(`app ${APP_NAME}: ${describeAppView(view)}`);
+            lastKey = key;
         }
-        if (slot === "failed") {
-            console.error(`✗ runtime failed in slot "${slot}"`);
-            console.log(pretty(res.json));
-            // Best-effort log tail: the sandbox's build/run log is the only
-            // way to see WHY (cargo error, missing env, bind failure). The
-            // token is required here too — /logs is behind the same proxy.
-            const logs = await request("GET", `${joinUrl(endpoint, "logs")}?lines=40`, { headers: authHeaders(token) });
-            if (logs.ok) console.error(`--- last log lines ---\n${logs.text}`);
-            return false;
+        // §7.7: PUT is legal on a FAILED app, so while a pending replacement exists
+        // the CURRENT record is old state and may legitimately be failed (or ready).
+        // Nothing about it ends the poll; only the disappearance of `pending` does.
+        if (view.pending === null) {
+            if (input.target.operation === "replace") {
+                if (targetRevision === null) {
+                    // readUploadOutcome rejects such a 202, so reaching this means a
+                    // direct caller gave the poll a replace target it cannot verify.
+                    // Never fall back to "current is ready" — that is the old
+                    // success-on-old-revision bug.
+                    return { ok: false, view, reason: `a replace poll needs the pending revision, but the target was null — refusing to treat the current revision as the replacement` };
+                }
+                if ((view.revision ?? 0) < targetRevision) {
+                    // The pending revision vanished without becoming current → failed.
+                    // The old record is returned untouched (its revision/status/error
+                    // stay visible to the caller); only the "still serving" half is
+                    // conditional, because a previously FAILED old app is registered
+                    // (§9.1) but not serving.
+                    const previous =
+                        view.status === "ready" && view.ready
+                            ? "the previous revision is still serving"
+                            : `the previous revision (status ${view.status}) remains registered and is NOT serving`;
+                    return { ok: false, view, reason: `the replacement revision ${targetRevision} failed — ${view.lastReplaceError ?? "no lastReplaceError reported"}; ${previous}` };
+                }
+                if (view.status === "ready" && view.ready) {
+                    // The admitted revision is current AND serving. §5.2: `ready`
+                    // requires status==="ready" AND the last probe succeeded.
+                    return { ok: true, view };
+                }
+                if (view.status === "failed") {
+                    // The new revision became current and then failed: this is the new
+                    // app's failure, not a failed replacement of the old one.
+                    return { ok: false, view, reason: `the replacement revision ${view.revision ?? "?"} became current and failed: ${view.error ?? "no error code reported"}` };
+                }
+            } else {
+                // create: the accepted revision must be current and serving.
+                const revisionReached = targetRevision === null || (view.revision ?? 0) >= targetRevision;
+                if (view.status === "ready" && view.ready && revisionReached) {
+                    return { ok: true, view };
+                }
+                if (view.status === "failed") {
+                    return { ok: false, view, reason: `app "${APP_NAME}" failed: ${view.error ?? "no error code reported"}` };
+                }
+            }
         }
-        if (++tick % 10 === 0) log(`still ${slot}… (${Math.round((deadline - Date.now()) / 1000)} s of budget left)`);
-        await sleep(POLL_INTERVAL_MS);
+        if (++tick % 10 === 0) logImpl(`still ${view.status}${view.pending ? ` (pending ${view.pending.status})` : ""}… (${Math.round((deadline - Date.now()) / 1000)} s of budget left)`);
+        await sleepImpl(POLL_INTERVAL_MS);
     }
-    console.error(`✗ timed out after ${Math.round(capMs / 60_000)} min waiting for "ready" (last slot: ${lastSlot || "never seen"})`);
-    return false;
+    return { ok: false, reason: `timed out after ${Math.round(input.capMs / 60_000)} min waiting for revision ${targetRevision ?? "?"} to be ready (last state: ${lastKey || "never seen"})` };
 }
 
-/** Handles the 409 the single-slot runtime returns when it is already busy. */
-function handleBusy(status: number, json: any) {
-    if (status !== 409) return false;
-    console.error(`\n✗ runtime already active — run with --teardown first`);
-    console.error(`  the sandbox holds one runtime slot; it is in "${json?.slot ?? "non-empty"}" state (even "failed" occupies it).`);
-    return true;
+/**
+ * Best-effort log tail after a failure: the app's own runtime log is the only
+ * way to see WHY (cargo error, missing env, bind failure). The preview token is
+ * required here too — /apps/<name>/logs is behind the same proxy, and the admin
+ * Bearer when the runner has auth enabled (§7.10/§12.3).
+ */
+export async function fetchAppLogs(endpoint: string, credentials: Credentials, lines = 40, requestImpl: RequestFn = request): Promise<string | null> {
+    const res = await requestImpl("GET", appLogsUrl(endpoint, lines), { headers: requestHeaders(credentials), timeoutMs: 15_000 });
+    return res.ok ? res.text : null;
 }
 
 // ── dry run ─────────────────────────────────────────────────────────────────
@@ -638,10 +977,10 @@ function handleBusy(status: number, json: any) {
  * exec, no network, and no file writes. Used to sanity-check an endpoint/config
  * before spending sandbox time, and to show where the artifact would be.
  */
-function printDryRunPlan(args: DeployArgs, config: unknown) {
+export function printDryRunPlan(args: DeployArgs, config: Record<string, unknown>): void {
     const isNexus = args.mode === "local";
-    const profile = isNexus ? PROFILE_NEXUS : PROFILE_MANIFEST;
-    log(`dry run — mode ${args.mode}, profile ${profile}, no cargo / no network / no writes`);
+    const profile = profileFor(args);
+    log(`dry run — mode ${args.mode}, profile ${profile}, app ${APP_NAME}, no cargo / no network / no writes`);
     if (isNexus) {
         // C2: the plan mirrors resolveArtifact's precedence exactly, so a dry
         // run tells the truth about which bundle a real run would ship.
@@ -668,23 +1007,27 @@ function printDryRunPlan(args: DeployArgs, config: unknown) {
     } else {
         const found = probe(srcTarball);
         log(`source bundle: ${srcTarball} ${found.exists ? `✓ ${bytes(found.size)}` : "(absent — a real run creates it via system tar)"}`);
-        log(`tar excludes: ${tarExcludes.join(", ")}`);
+        log(`tar excludes: ${TAR_EXCLUDES.join(", ")}`);
+        log("remote-build runCmd: NEXUS_LISTEN=127.0.0.1:$PORT ./target/release/nexus-hub (the runner injects PORT; the manifest profile has no derived NEXUS_LISTEN)");
     }
-    // Validating the URL here (not just before the POST) is the point of a dry
+    // Validating the URL here (not just before the upload) is the point of a dry
     // run: a malformed endpoint should fail in the plan, not after the build.
     if (args.endpoint) requireEndpoint(args.endpoint);
-    const endpointLabel = args.endpoint ? args.endpoint : "(none — --endpoint not set)";
-    const target = args.endpoint ? joinUrl(args.endpoint, "") : "<endpoint>/";
-    log(`endpoint: ${endpointLabel}${args.endpoint ? `  →  POST target ${target}` : ""}`);
+    const method = args.replace ? "PUT" : "POST";
+    const target = args.endpoint ? uploadUrl(args.endpoint, args.replace) : `<endpoint>/${args.replace ? APP_ROUTE : APPS_ROUTE}`;
+    const stateTarget = args.endpoint ? appStateUrl(args.endpoint) : `<endpoint>/${APP_ROUTE}`;
+    log(`endpoint: ${args.endpoint || "(none — --endpoint not set)"}`);
+    if (args.endpoint) log(`v2 preflight: GET ${healthUrl(args.endpoint)} — refuses a non-v2 runner before any upload`);
     const filename = isNexus ? BIN_NAME : "nexus-src.tar.gz";
     log(
-        `request that would be sent:\n  POST ${target}\n  content-type: application/octet-stream\n  x-runtime-profile: ${profile}\n` +
+        `request that would be sent:\n  ${method} ${target}\n  content-type: application/octet-stream\n  x-app-name: ${APP_NAME}\n  x-runtime-profile: ${profile}\n` +
             `  x-runtime-filename: ${filename}\n  x-runtime-config: ${b64url(config).slice(0, 24)}… (base64url, masked; decoded below)\n` +
-            // C1: shown masked — the plan is pasted into logs/terminals, the
-            // preview token must never be echoed in full.
-            authPlanLine(args.token),
+            // Secrets are shown masked — the plan is pasted into logs/terminals.
+            `${secretPlanLine("x-daytona-preview-token", args.token)}${args.token ? "" : "  (no --token / NEXUS_DAYTONA_PREVIEW_TOKEN)"}\n` +
+            `${secretPlanLine("authorization", args.adminToken)}${args.adminToken ? "  ← Bearer <admin token>" : "  (no --admin-token / NEXUS_SANDBOX_ADMIN_TOKEN)"}`,
     );
-    console.log(`  config:\n${pretty(config).split("\n").map((l) => `    ${l}`).join("\n")}`);
+    console.log(`  config (decoded):\n${pretty(config).split("\n").map((l) => `    ${l}`).join("\n")}`);
+    console.log(`  config.port: ${args.port === undefined ? "ABSENT — the runner auto-allocates a loopback port (v2 default)" : `${args.port} (explicit; must be free and non-reserved)`}`);
     const bodyNote = isNexus
         ? args.artifact
             ? `${args.artifact} as it sits on disk (cargo skipped)`
@@ -693,7 +1036,11 @@ function printDryRunPlan(args: DeployArgs, config: unknown) {
               : `the ${BIN_NAME} ELF once compiled here (a few MiB)`
         : "nexus-src.tar.gz source tree (a few hundred KiB)";
     console.log(`  body: raw application/octet-stream — ${bodyNote}`);
-    log(`after 202: ${args.wait ? `poll GET ${args.endpoint ? joinUrl(args.endpoint, "status") : "<endpoint>/status"} every ${POLL_INTERVAL_MS / 1000}s (auth header on every poll; up to ${POLL_TRANSIENT_MAX} consecutive fetch blips tolerated), cap ${WAIT_CAP_MS[profile] / 60_000} min` : "no wait (--no-wait)"}; 409 → "run with --teardown first", exit 1`);
+    log(
+        `after 202: ${args.wait ? `poll GET ${stateTarget} every ${POLL_INTERVAL_MS / 1000}s (auth on every poll; up to ${POLL_TRANSIENT_MAX} consecutive fetch blips tolerated), cap ${waitCapMs(profile) / 60_000} min` : "no wait (--no-wait)"}; ` +
+            `409 app_exists → "--replace or --teardown", exit 1`,
+    );
+    if (args.wait) log(`on success: path ${APP_PATH}, hub URL ${args.endpoint ? resolveAppUrl(args.endpoint, { path: APP_PATH }) : `<endpoint>${APP_PATH}`} (no per-port preview link)`);
     ok("dry run complete (exit 0)");
 }
 
@@ -703,73 +1050,61 @@ function printDryRunPlan(args: DeployArgs, config: unknown) {
  * still a valid plan check). The endpoint is only validated, never contacted,
  * and may be omitted entirely in a dry run.
  */
-function printTeardownPlan(args: DeployArgs) {
-    log("dry run — teardown, no cargo / no network / no writes");
+export function printTeardownPlan(args: DeployArgs): void {
+    log(`dry run — teardown of app "${APP_NAME}", no cargo / no network / no writes`);
     if (args.endpoint) requireEndpoint(args.endpoint);
-    const target = args.endpoint ? joinUrl(args.endpoint, "") : "<endpoint>/";
-    log(`request that would be sent:\n  DELETE ${target}\n  (idempotent: an empty slot still answers { tornDown: true })`);
-    console.log(authPlanLine(args.token));
+    const target = args.endpoint ? appTeardownUrl(args.endpoint) : `<endpoint>/${APP_ROUTE}`;
+    log(`request that would be sent:\n  DELETE ${target}\n  (idempotent: an already-absent app still answers { tornDown: true, removed: false })`);
+    console.log(secretPlanLine("x-daytona-preview-token", args.token));
+    console.log(`${secretPlanLine("authorization", args.adminToken)}${args.adminToken ? "  ← Bearer <admin token>" : ""}`);
     ok("dry run complete (exit 0)");
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
-async function main() {
-    const args = parseArgs(process.argv.slice(2));
+export async function main(argv: string[] = process.argv.slice(2), requestImpl: RequestFn = request): Promise<number> {
+    const args = parseArgs(argv);
     if (args.help) {
-        console.log(usage);
-        process.exit(0);
+        console.log(USAGE);
+        return 0;
     }
+    const credentials = credentialsOf(args);
 
-    // Teardown is its own verb: DELETE / is idempotent, so it needs neither a
-    // mode nor an artifact.
+    // Teardown is its own verb: DELETE /apps/nexus is idempotent, so it needs
+    // neither a mode nor an artifact.
     if (args.teardown) {
         // C5: a dry run prints the DELETE rather than sending it — no network,
         // no endpoint requirement, exit 0 even against an unreachable host.
         if (args.dryRun) {
             printTeardownPlan(args);
-            return;
+            return 0;
         }
         const endpoint = requireEndpoint(args.endpoint);
-        log(`DELETE ${joinUrl(endpoint, "")} — teardown`);
-        // C1: / (DELETE) is guarded by the same preview proxy as everything else.
-        const res = await request("DELETE", joinUrl(endpoint, ""), { headers: authHeaders(args.token), timeoutMs: 60_000 });
+        await requireV2Runner(endpoint, credentials, requestImpl);
+        const url = appTeardownUrl(endpoint);
+        log(`DELETE ${url} — teardown of app "${APP_NAME}" (the SANDBOX is not deleted)`);
+        const res = await requestImpl("DELETE", url, { headers: requestHeaders(credentials), timeoutMs: 60_000 });
+        const outcome = readTeardownOutcome(res);
+        if (!outcome.ok) die(`teardown failed: ${outcome.reason}`);
         console.log(pretty(res.json ?? { status: res.status, text: res.text.slice(0, 400) }));
-        if (!res.ok) die(`teardown failed with HTTP ${res.status}`);
-        ok("runtime torn down — slot is empty, POST again");
-        return;
+        if (outcome.removed) ok(`app "${APP_NAME}" removed — GET /apps/${APP_NAME} now answers 404, the sandbox keeps running`);
+        else ok(`no app named "${APP_NAME}" — nothing to remove (removed:false); the sandbox keeps running`);
+        return 0;
     }
 
-    // Config sent in x-runtime-config; only overrides, the sandbox owns the
-    // rest of the profile defaults.
-    const profile = args.mode === "local" ? PROFILE_NEXUS : PROFILE_MANIFEST;
-    const config =
-        args.mode === "local"
-            ? // nexus profile: port + extra env. anonymous:true is a sandbox
-              // default, so it is only worth overriding if a caller wants it.
-              { port: args.port, env: args.env }
-            : // manifest profile: build inside the sandbox, then run the artifact
-              // it produced. artifactPath/runCmd are extraction-dir relative, and
-              // `./target` is right there because the tarball has no
-              // repo-root .cargo/config.toml (so no .rust/target remap).
-              {
-                  buildCmd: "cargo build --release --locked -p nexus-server",
-                  buildTimeoutSec: 1800,
-                  artifactPath: `target/release/${BIN_NAME}`,
-                  runCmd: `./target/release/${BIN_NAME}`,
-                  env: args.env,
-                  port: args.port,
-                  probePath: "/v1/observe",
-                  probeTimeoutSec: 60,
-                  stopSignal: "SIGINT",
-              };
+    const profile = profileFor(args);
+    const config = buildAppConfig(args);
 
     if (args.dryRun) {
         printDryRunPlan(args, config);
-        return;
+        return 0;
     }
 
     const endpoint = requireEndpoint(args.endpoint);
-    let bundle;
+    // v2 gate: refuse a v1 single-slot runner BEFORE spending build time or
+    // uploading bytes, with the exact reason and the fix.
+    await requireV2Runner(endpoint, credentials, requestImpl);
+
+    let bundle: Probed;
     if (args.mode === "local") {
         // C2/C3: honours --no-build/--artifact and rejects a non-ELF bundle
         // before a single byte is uploaded.
@@ -778,31 +1113,138 @@ async function main() {
         bundle = buildSourceTarball();
     }
 
-    log(`POST ${joinUrl(endpoint, "")} — profile ${profile}, ${bytes(bundle.size)}`);
+    const operation = args.replace ? "replace" : "create";
+    const filename = args.mode === "local" ? BIN_NAME : "nexus-src.tar.gz";
+    const target = uploadUrl(endpoint, args.replace);
+    log(`${args.replace ? "PUT" : "POST"} ${target} — app ${APP_NAME}, profile ${profile}, ${bytes(bundle.size)}`);
     // Read the bytes here (not at build time) so the body matches what is on
     // disk right before sending; the size printed above is the same stat.
     const payload = readFileSync(bundle.path);
-    const res = await postBundle(endpoint, {
-        profile,
-        config,
-        filename: args.mode === "local" ? BIN_NAME : "nexus-src.tar.gz",
-        body: payload,
-        // C1: the upload itself is behind the preview proxy too.
-        token: args.token,
+    const res = await requestImpl(args.replace ? "PUT" : "POST", target, {
+        headers: buildUploadHeaders(args, config, filename),
+        body: payload as unknown as BodyInit,
+        // A 3+ MiB binary through a preview proxy is slower than a GET.
+        timeoutMs: 120_000,
     });
-    // Pretty-print whatever the runner said (202 runtime info, 409 slot info,
+    // Pretty-print whatever the runner said (202 app/pending info, a 409 code,
     // or the raw proxy error page when the body is not JSON).
     console.log(pretty(res.json ?? { status: res.status, text: (res.text ?? "").slice(0, 400) }));
-    if (handleBusy(res.status, res.json)) process.exit(1);
-    if (res.status !== 202 && !res.ok) die(`POST failed with HTTP ${res.status}`, (res.text ?? "").slice(0, 400));
-    ok(`accepted (HTTP ${res.status}) — sandbox is staging/building/booting`);
+    const outcome = readUploadOutcome(res, operation);
+    if (!outcome.accepted) die(`${operation === "replace" ? "PUT" : "POST"} failed: ${outcome.reason}`);
+    ok(`accepted (HTTP 202) — the sandbox is staging/building/booting app "${APP_NAME}"`);
+    if (outcome.view) log(`accepted revision ${outcome.view.revision ?? "?"} (${outcome.view.status}), internal port ${outcome.view.internalPort ?? "auto/not yet allocated"}`);
+    if (outcome.operation === "replace" && outcome.targetRevision !== null) {
+        log(`blue-green: the current revision keeps serving at ${APP_PATH} until revision ${outcome.targetRevision} is ready`);
+    }
 
     if (!args.wait) {
-        log("not waiting (--no-wait); poll GET /status when you want the port");
-        return;
+        log(`not waiting (--no-wait); poll GET ${appStateUrl(endpoint)} when you want the state`);
+        return 0;
     }
-    const ready = await pollUntilReady(endpoint, WAIT_CAP_MS[profile], args.token);
-    if (!ready) process.exit(1);
+    const polled = await pollAppUntilReady({
+        endpoint,
+        credentials,
+        target: { operation: outcome.operation, revision: outcome.targetRevision },
+        capMs: waitCapMs(profile),
+        requestImpl,
+    });
+    if (!polled.ok) {
+        // Surface the record even on failure: revision, status, internal port, path
+        // and the runner's short error code are what an operator correlates with
+        // the log tail (and `path` proves the route that WAS being served).
+        if (polled.view) {
+            console.error(`✗ app ${APP_NAME}: ${describeAppView(polled.view)}`);
+            console.error(`  path: ${polled.view.path}${polled.view.publicUrl ? `  publicUrl: ${polled.view.publicUrl}` : ""}`);
+        }
+        console.error(`✗ ${polled.reason}`);
+        const logs = await fetchAppLogs(endpoint, credentials, 40, requestImpl);
+        if (logs !== null) console.error(`--- last log lines (GET /apps/${APP_NAME}/logs?lines=40) ---\n${logs}`);
+        return 1;
+    }
+    const view = polled.view;
+    const hubUrl = resolveAppUrl(endpoint, view);
+    ok(`app "${APP_NAME}" is ready — revision ${view.revision ?? "?"}, status ${view.status}, internal port ${view.internalPort ?? "?"}`);
+    log(`  path:    ${view.path}`);
+    log(`  hub URL: ${hubUrl ?? "(not determinable)"}  ← clients use this base; no per-port preview link`);
+    console.log(pretty({ app: view, hubUrl }));
+    return 0;
 }
 
-main().catch((error: Error) => die(error.stack ?? String(error)));
+// ══════════════════════════════════════════════════════════════════════════════
+//  ENTRY POINT — importing this module must never start anything
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  Same three rules as start-daytona.ts / deploy-endpoint.ts: `yarn
+//  deploy:daytona` must auto-run, and `vitest` importing this file must not.
+//  Rule 3 exists because a PLAIN `vite-node <file>` rewrites process.argv and
+//  DROPS the file (measured in setup-sandbox.ts), so neither argv nor the
+//  lifecycle line can see the entry; a stack probe is evidence only inside
+//  vite-node's module runner, which is exactly where that gap is.
+
+/** Extension-bearing token that identifies THIS file as the runnable script. */
+const ENTRY_SCRIPT_PATTERN = /(?:^|[/\\])deploy-daytona\.[cm]?[jt]sx?$/;
+/** vite/vite-node append module ids and query strings; strip them before matching. */
+const stripModuleQuery = (token: string): string => String(token).split("?")[0]!.split("#")[0]!;
+const isScriptToken = (token: unknown): boolean => ENTRY_SCRIPT_PATTERN.test(stripModuleQuery(String(token)));
+
+/** Signals the entry detector reads — every field is process state, gathered once at import. */
+export type EntryPointSignals = { argv?: readonly string[]; env?: Readonly<Record<string, string | undefined>>; modulePath?: string; stack?: string; vitest?: boolean };
+
+/** Rule 1: argv's SCRIPT POSITIONAL is this file. */
+const namesScriptPositional = (argv: readonly string[] | undefined): boolean => {
+    const tokens = argv ?? [];
+    if (isScriptToken(tokens[1])) return true;
+    const flag = tokens.indexOf("--script");
+    return flag !== -1 && isScriptToken(tokens[flag + 1]);
+};
+
+/** Rule 2: the npm/yarn lifecycle line names it (`deploy:daytona` = "vite-node scripts/deploy-daytona.ts"). */
+const namesLifecycleEntryPoint = (env: Readonly<Record<string, string | undefined>> | undefined): boolean =>
+    String(env?.npm_lifecycle_script ?? "")
+        .split(/\s+/)
+        .some(isScriptToken);
+
+/** Rule 3: vite-node evaluated THIS file as its entry — only runner frames sit above it. */
+const isRunnerEntryPoint = (stack: string | undefined, modulePath: string | undefined): boolean => {
+    if (!stack || !modulePath) return false;
+    const frames = stack.split("\n").map((frame) => frame.trim().replace("file://", ""));
+    if (!frames.some((frame) => frame.includes("ViteNodeRunner"))) return false;
+    const own = frames.reduce((found, frame, index) => (frame.includes(modulePath) ? index : found), -1);
+    if (own < 0) return false;
+    const callers = frames.slice(own + 1);
+    const executeFile = callers.findIndex((frame) => frame.includes("ViteNodeRunner.executeFile"));
+    const upTo = executeFile === -1 ? callers.length : executeFile;
+    return callers.slice(0, upTo).every((frame) => frame.includes("ViteNodeRunner"));
+};
+
+/** True when — and only when — this module is the process entry point. */
+export const isCliEntryPoint = (signals: EntryPointSignals): boolean => {
+    if (signals.vitest) return false;
+    if (namesScriptPositional(signals.argv)) return true;
+    if (namesLifecycleEntryPoint(signals.env)) return true;
+    return isRunnerEntryPoint(signals.stack, signals.modulePath);
+};
+
+/** This file's own path (rule 3 needs to identify its own stack frames). */
+const MODULE_FILE_PATH = (() => {
+    try {
+        return fileURLToPath(import.meta.url);
+    } catch {
+        // vitest may hand a non-file import.meta.url (see SCRIPTS_DIR_CANDIDATES).
+        return join(here, "deploy-daytona.ts");
+    }
+})();
+
+// The stack must be captured during module evaluation; inside main() the
+// evidence for rule 3 is already gone.
+if (isCliEntryPoint({ argv: process.argv, env: process.env, modulePath: MODULE_FILE_PATH, stack: new Error().stack, vitest: Boolean(process.env.VITEST) })) {
+    main().then(
+        (code) => {
+            process.exitCode = code;
+        },
+        (failure) => {
+            console.error(`[nexus:deploy] ✗ unexpected failure: ${failure instanceof Error ? (failure.stack ?? failure.message) : String(failure)}`);
+            process.exitCode = 1;
+        },
+    );
+}

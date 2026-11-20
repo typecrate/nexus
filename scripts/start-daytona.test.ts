@@ -4,15 +4,17 @@
 //  Everything side-effectful in start-daytona.ts sits behind an injected dep
 //  (createSandbox / spawn / log / error / env), so these tests drive the REAL
 //  control flow with fakes and assert EXACT values:
-//    · parser     — defaults, every flag, --env repeats, out-of-range words,
-//                   and each illegal combination
+//    · parser     — defaults (AUTO port, no admin token), every flag, --env repeats,
+//                   out-of-range words, and each illegal combination
 //    · plan / argv— the whole deploy argv array per mode, plus command/cwd/env
-//    · flow       — fresh success (create once → spawn once → hub URL → the
-//                   machine-readable last line), deploy failure (delete, and
-//                   --keep-on-fail not deleting, and a delete that itself fails),
-//                   reuse (no lifecycle at all), teardown (endpoint/token/--teardown
-//                   only), dry-run (no create, no spawn, no fetch), exit codes
-//    · interrupt  — decideInterruptCleanup's policy table, and the fresh-mode fence
+//    · summary    — endpoint + /app/nexus/ in fresh AND reuse mode, hubToken as the
+//                   SAME credential as token, hubPort only when explicitly typed
+//    · flow       — fresh success (create once → spawn once → derived hub URL → the
+//                   machine-readable last line, and NO getPreviewLink call), deploy
+//                   failure (delete / --keep-on-fail / a delete that fails), reuse
+//                   (derived URL, no lifecycle), teardown (DELETE /apps/nexus only),
+//                   dry-run (no create, no spawn, no fetch), exit codes
+//    · interrupt  — decideInterruptCleanup's v2 phase table, and the fresh-mode fence
 //                   fired through an injected onSignal: SIGINT/SIGTERM mid-deploy
 //                   delete the sandbox and exit 130/143, a hung delete still exits
 //                   after the bounded wait, and reuse/teardown/dry-run trap nothing
@@ -29,13 +31,19 @@
 //  through the injected SpawnImpl seam.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 // Hoisted above the imports by vitest: the barrel resolves to a spy, not to the real
 // SDK, so nothing in this file can reach Daytona even by accident.
-vi.mock('@services/daytona/sandbox', () => ({ createSandbox: vi.fn() }));
+vi.mock('@services/daytona/sandbox', () => ({
+    createSandbox: vi.fn(),
+    // The real barrel's §12.3 env names, so the production resolver is exercised
+    // against the same spellings the shared module exports.
+    ADMIN_TOKEN_ENV: 'SANDBOX_ADMIN_TOKEN',
+    ADMIN_TOKEN_FILE_ENV: 'SANDBOX_ADMIN_TOKEN_FILE',
+}));
 
 import { createSandbox } from '@services/daytona/sandbox';
 import {
@@ -45,14 +53,15 @@ import {
     buildSummary,
     createDefaultDeps,
     decideInterruptCleanup,
-    DEFAULT_HUB_PORT,
     DEPLOY_SCRIPT_PATH,
+    HUB_PATH,
     INTERRUPT_DELETE_TIMEOUT_MS,
     isCliEntryPoint,
     main,
     needsPreviewToken,
     PACKAGE_ROOT,
     parseArgs,
+    previewLabel,
     resolveMode,
     runStartDaytona,
     spawnDeploy,
@@ -77,8 +86,21 @@ const flagsOf = (argv: readonly string[]): StartDaytonaFlags => parseArgs(argv).
 /** The env object handed to every fake; identity is asserted to prove it is untouched. */
 const ENV = { PATH: '/usr/bin', HTTPS_PROXY: 'http://proxy:3128' };
 
-/** What a fake createSandbox resolves: a structural SandboxHandle with recorded calls. */
-const makeHandle = (overrides: Partial<SandboxHandle> = {}): SandboxHandle & { sandbox: { delete: ReturnType<typeof vi.fn>; getPreviewLink: ReturnType<typeof vi.fn> } } =>
+/** A real 0600 admin-token file under the repo-root Temp scratch (AGENTS.md). */
+const ADMIN_TOKEN = 'file-admin-token-0123456789';
+const writeAdminTokenFile = (): string => {
+    const path = join(PACKAGE_ROOT, '..', '..', '..', 'Temp', 't7b', 'admin-token');
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${ADMIN_TOKEN}\n`, { mode: 0o600 });
+    return path;
+};
+
+/**
+ * What a fake createSandbox resolves: a structural SandboxHandle with recorded calls.
+ * `getPreviewLink` is present ON PURPOSE even though the v2 handle type no longer has
+ * it: the regression this suite owns is that a fresh/reuse run NEVER calls it.
+ */
+const makeHandle = (overrides: Partial<SandboxHandle> = {}) =>
     ({
         endpoint: 'https://proxy.example/runner-7777',
         token: 'dtn_preview_token',
@@ -117,9 +139,9 @@ const makeDeps = (handle: SandboxHandle | undefined, exitCode = 0) => {
 const makeInterruptDeps = (
     handle: SandboxHandle,
     options: {
-        /** When the signal is fired: while the deploy child is in flight, or while the hub URL is minted. */
-        fireDuring?: 'deploy' | 'mint';
         signal?: StartSignal;
+        /** false = record the wiring but never fire, for the "only the happy path ran" test. */
+        fire?: boolean;
         /** Override sandbox.delete to model a failing or a never-returning delete. */
         deleteImpl?: () => Promise<unknown>;
         /** Override the bounded wait so the timeout branch needs no real 10s. */
@@ -131,7 +153,7 @@ const makeInterruptDeps = (
     /** signal → live listener. Empty after a run means nothing is left trapped. */
     const trapped = new Map<StartSignal, () => void>();
     const signal = options.signal ?? 'SIGINT';
-    /** Fires at most once, at the point the flow reaches the requested phase. */
+    /** Fires at most once, while the deploy child is in flight. */
     let fired = false;
     const fire = (): void => {
         if (fired) return;
@@ -139,17 +161,10 @@ const makeInterruptDeps = (
         trapped.get(signal)?.();
     };
     if (options.deleteImpl) handle.sandbox.delete = vi.fn(options.deleteImpl) as unknown as typeof handle.sandbox.delete;
-    if (options.fireDuring === 'mint') {
-        const realMint = handle.sandbox.getPreviewLink;
-        handle.sandbox.getPreviewLink = vi.fn(async (port: number) => {
-            fire();
-            return realMint(port);
-        }) as typeof handle.sandbox.getPreviewLink;
-    }
     const deps: StartDaytonaDeps = {
         createSandbox: vi.fn(async () => handle),
         spawn: vi.fn(async () => {
-            if (options.fireDuring === 'deploy') fire();
+            if (options.fire !== false) fire();
             return 0;
         }),
         log: (line) => lines.push(line),
@@ -192,15 +207,14 @@ describe('start-daytona: module pins (paths resolved from import.meta.url, never
         expect(existsSync(DEPLOY_SCRIPT_PATH)).toBe(true);
     });
 
-    it('keeps the hub-port default in lockstep with deploy-daytona.ts DEFAULT_PORT', () => {
-        // Drift between the two defaults is a silent mis-deploy, so it is pinned.
-        expect(DEFAULT_HUB_PORT).toBe(8085);
-        expect(flagsOf([]).port).toBe(8085);
+    it('names the one public app path, and has no per-port default left to drift', () => {
+        expect(HUB_PATH).toBe('/app/nexus/');
+        expect(flagsOf([]).port).toBeUndefined();
     });
 });
 
 describe('start-daytona: argument parsing', () => {
-    it('defaults to a fresh local deploy on the hub port, with no errors', () => {
+    it('defaults to a fresh local deploy with an AUTO port and no admin token', () => {
         const { flags, errors } = parseArgs([]);
         expect(errors).toEqual([]);
         expect(flags).toEqual({
@@ -212,8 +226,10 @@ describe('start-daytona: argument parsing', () => {
             public: true,
             endpoint: '',
             token: '',
+            adminToken: '',
             mode: 'local',
-            port: 8085,
+            port: undefined,
+            replace: false,
             env: {},
             noBuild: false,
             artifact: '',
@@ -222,7 +238,7 @@ describe('start-daytona: argument parsing', () => {
     });
 
     it('parses every flag into the exact flag record', () => {
-        const { flags, errors } = parseArgs(['--api-key', 'dtn_key', '--ttl', '30', '--private', '--snapshot', 'toolchain-v1', '--cpu', '2', '--mem', '4', '--disk', '20', '--mode', 'remote-build', '--port', '9000', '--env', 'A=1', '--no-wait', '--keep-on-fail']);
+        const { flags, errors } = parseArgs(['--api-key', 'dtn_key', '--ttl', '30', '--private', '--snapshot', 'toolchain-v1', '--cpu', '2', '--mem', '4', '--disk', '20', '--mode', 'remote-build', '--port', '9000', '--replace', '--admin-token', 'at', '--env', 'A=1', '--no-wait', '--keep-on-fail']);
         expect(errors).toEqual([]);
         expect(flags).toEqual({
             help: false,
@@ -238,8 +254,10 @@ describe('start-daytona: argument parsing', () => {
             public: false,
             endpoint: '',
             token: '',
+            adminToken: 'at',
             mode: 'remote-build',
             port: 9000,
+            replace: true,
             env: { A: '1' },
             noBuild: false,
             artifact: '',
@@ -271,14 +289,18 @@ describe('start-daytona: argument parsing', () => {
         expect(parseArgs(['--env', 'NOPE']).errors).toEqual(['--env expects KEY=VALUE, got "NOPE"']);
     });
 
-    it('range-checks every numeric flag with the service\'s exact words', () => {
-        expect(parseArgs(['--port', '0']).errors).toEqual(['--port "0" is out of range (TCP port 1-65535)']);
-        expect(parseArgs(['--port', '65536']).errors).toEqual(['--port "65536" is out of range (TCP port 1-65535)']);
+    it('range-checks every numeric flag, with --port 0 meaning AUTO', () => {
+        expect(parseArgs(['--port', '-1']).errors).toEqual(['--port "-1" is out of range (TCP port 0-65535 (0 = auto))']);
+        expect(parseArgs(['--port', '65536']).errors).toEqual(['--port "65536" is out of range (TCP port 0-65535 (0 = auto))']);
         expect(parseArgs(['--cpu', 'zero']).errors).toEqual(['--cpu "zero" is out of range (vCPU, >= 1)']);
         expect(parseArgs(['--ttl', '-1']).errors).toEqual(['--ttl "-1" is out of range (minutes, >= 0 (0 = disabled))']);
         // ttl is the ONE flag where 0 is meaningful ("no fence").
         expect(parseArgs(['--ttl', '0']).errors).toEqual([]);
         expect(flagsOf(['--ttl', '0']).ttl).toBe(0);
+        // port 0 is the explicit spelling of auto, and must land as "no port".
+        expect(parseArgs(['--port', '0']).errors).toEqual([]);
+        expect(flagsOf(['--port', '0']).port).toBeUndefined();
+        expect(flagsOf(['--port', '20042']).port).toBe(20042);
     });
 
     it('rejects an unknown --mode and the remote-build build-skip contradiction', () => {
@@ -287,17 +309,18 @@ describe('start-daytona: argument parsing', () => {
         expect(parseArgs(['--mode', 'remote-build', '--artifact', 'x']).errors).toEqual(['--no-build and --artifact apply to --mode local only (remote-build ships a source tarball)']);
     });
 
-    it('rejects --teardown without --endpoint (a fresh slot has nothing to tear down)', () => {
-        expect(parseArgs(['--teardown']).errors).toEqual(['--teardown needs --endpoint <url> — a fresh sandbox has an empty runtime slot, and this script never tears down a sandbox it did not create']);
+    it('rejects --teardown without --endpoint (a fresh registry has nothing to tear down)', () => {
+        expect(parseArgs(['--teardown']).errors).toEqual(['--teardown needs --endpoint <url> — a fresh sandbox has an empty app registry, and this script never tears down a sandbox it did not create']);
         expect(parseArgs(['--teardown']).flags.teardown).toBe(true);
+        expect(parseArgs(['--teardown', '--replace', '--endpoint', 'https://proxy.example/runner-7777']).errors).toEqual(['--teardown and --replace are different verbs — pick one']);
         expect(parseArgs(['--teardown', '--endpoint', 'https://proxy.example/runner-7777']).errors).toEqual([]);
     });
 
     it('rejects sandbox-creation flags combined with --endpoint, naming only the offenders', () => {
         expect(parseArgs(['--endpoint', 'https://e.example', '--cpu', '2']).errors).toEqual(['--cpu only apply when this script creates the sandbox — drop --endpoint (fresh) or drop it (reusing https://e.example)']);
         expect(parseArgs(['--endpoint', 'https://e.example', '--private', '--ttl', '5']).errors).toEqual(['--private, --ttl only apply when this script creates the sandbox — drop --endpoint (fresh) or drop them (reusing https://e.example)']);
-        // --token alone is targeting, not creation, so it stays legal with --endpoint.
-        expect(parseArgs(['--endpoint', 'https://e.example', '--token', 't', '--keep-on-fail']).errors).toEqual([]);
+        // --token/--admin-token alone are targeting, not creation, so they stay legal.
+        expect(parseArgs(['--endpoint', 'https://e.example', '--token', 't', '--admin-token', 'a', '--keep-on-fail']).errors).toEqual([]);
     });
 
     it('rejects --token without --endpoint: a fresh run takes its token from createSandbox', () => {
@@ -311,7 +334,7 @@ describe('start-daytona: argument parsing', () => {
         expect(parseArgs(['--endpoint', 'https://e.example', '--token', 't']).errors).toEqual([]);
         expect(parseArgs(['--teardown', '--endpoint', 'https://e.example', '--token', 't']).errors).toEqual([]);
         // teardown WITHOUT an endpoint reports only the missing endpoint, never both.
-        expect(parseArgs(['--teardown', '--token', 't']).errors).toEqual(['--teardown needs --endpoint <url> — a fresh sandbox has an empty runtime slot, and this script never tears down a sandbox it did not create']);
+        expect(parseArgs(['--teardown', '--token', 't']).errors).toEqual(['--teardown needs --endpoint <url> — a fresh sandbox has an empty app registry, and this script never tears down a sandbox it did not create']);
     });
 
     it('allows --dry-run with --endpoint (the reuse plan must be printable)', () => {
@@ -334,61 +357,66 @@ describe('start-daytona: mode resolution', () => {
 
 describe('start-daytona: sandbox option mapping', () => {
     it('maps only the knobs that were given, and never passes --port as the RUNNER port', () => {
-        const options = buildSandboxOptions(flagsOf(['--api-key', 'dtn_key', '--ttl', '30', '--private', '--snapshot', 'snap', '--cpu', '2', '--mem', '4', '--disk', '20', '--port', '9000']));
+        const options = buildSandboxOptions(flagsOf(['--api-key', 'dtn_key', '--ttl', '30', '--private', '--snapshot', 'snap', '--cpu', '2', '--mem', '4', '--disk', '20', '--port', '9000']), {});
         expect(options).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, public: false, snapshot: 'snap', cpu: 2, mem: 4, disk: 20 });
         // createSandbox's `port` is the RUNNER port (7777 = the management endpoint) while
-        // --port is the HUB port; forwarding it would repoint the deploy at the hub.
+        // --port is the APP's internal port; forwarding it would repoint the deploy.
         expect('port' in options).toBe(false);
     });
 
     it('defaults the sandbox to the measured minimal footprint: 1 vCPU / 1 GiB RAM / 3 GiB disk', () => {
-        const options = buildSandboxOptions(flagsOf([]));
+        const options = buildSandboxOptions(flagsOf([]), {});
         expect(options).toEqual({ public: true, cpu: 1, mem: 1, disk: 3 }); // hub 7.7 MB RSS / ~0.25 ms per request; 3 GiB = Daytona's own disk default
         expect(options.apiKey).toBeUndefined(); // '' → absent, so DAYTONA_API_KEY/vault still apply
         expect(options.ttlMinutes).toBeUndefined(); // unset = NO wall-clock kill fence
         expect(options.snapshot).toBeUndefined(); // the service's own default snapshot
     });
+
+    it('maps the §12.3 admin credential into the fresh boot options, file form first', () => {
+        // Explicit flag → env form handed to createSandbox (SANDBOX_ADMIN_TOKEN).
+        expect(buildSandboxOptions(flagsOf(['--admin-token', 'admin-token-value']), {})).toEqual({ public: true, cpu: 1, mem: 1, disk: 3, adminToken: 'admin-token-value' });
+        // The shared alias and the generic name are both read when no flag is typed.
+        expect(buildSandboxOptions(flagsOf([]), { NEXUS_SANDBOX_ADMIN_TOKEN: 'nexus-env-token-0123456789' })).toMatchObject({ adminToken: 'nexus-env-token-0123456789' });
+        expect(buildSandboxOptions(flagsOf([]), { SANDBOX_ADMIN_TOKEN: 'env-token-0123456789' })).toMatchObject({ adminToken: 'env-token-0123456789' });
+        // The preferred file form: only the PATH is passed; the value is read by the
+        // shared bring-up (uploaded 0600) and by resolveAdminBearer for the Bearer.
+        const filePath = writeAdminTokenFile();
+        expect(buildSandboxOptions(flagsOf([]), { SANDBOX_ADMIN_TOKEN_FILE: filePath })).toEqual({ public: true, cpu: 1, mem: 1, disk: 3, adminTokenFile: filePath });
+    });
 });
 
 describe('start-daytona: deploy argv per mode', () => {
-    it('fresh with a private endpoint carries the preview token, in the documented order', () => {
+    it('fresh with a private endpoint carries the preview token, in the documented order, with NO --port', () => {
         expect(buildDeployArgs(flagsOf(['--env', 'NEXUS_TOKEN=xyz']), { endpoint: 'https://proxy.example/runner-7777', token: 'dtn_preview_token' }, 'fresh')).toEqual([
             '--endpoint', 'https://proxy.example/runner-7777',
             '--token', 'dtn_preview_token',
             '--mode', 'local',
-            '--port', '8085',
             '--env', 'NEXUS_TOKEN=xyz',
         ]);
     });
 
-    it('omits --token entirely for a public endpoint (the child then sends no auth header)', () => {
-        const expected = ['--endpoint', 'https://proxy.example/runner-7777', '--mode', 'local', '--port', '8085'];
-        expect(buildDeployArgs(flagsOf([]), { endpoint: 'https://proxy.example/runner-7777', token: '' }, 'fresh')).toEqual(expected);
-        expect(buildDeployArgs(flagsOf([]), { endpoint: 'https://proxy.example/runner-7777', token: undefined }, 'fresh')).toEqual(expected);
-    });
-
-    it('forwards every deploy passthrough flag verbatim', () => {
-        expect(buildDeployArgs(flagsOf(['--mode', 'remote-build', '--port', '9000', '--env', 'B=2', '--env', 'A=1', '--no-wait']), { endpoint: 'https://e', token: 't' }, 'reuse')).toEqual([
+    it('forwards an explicit --port, --replace and --admin-token; omits --port when auto', () => {
+        expect(buildDeployArgs(flagsOf(['--port', '20042', '--replace', '--admin-token', 'at', '--mode', 'remote-build', '--env', 'B=2', '--no-wait']), { endpoint: 'https://e', token: 't' }, 'reuse')).toEqual([
             '--endpoint', 'https://e',
             '--token', 't',
+            '--admin-token', 'at',
             '--mode', 'remote-build',
-            '--port', '9000',
+            '--port', '20042',
+            '--replace',
             '--env', 'B=2',
-            '--env', 'A=1',
             '--no-wait',
         ]);
         expect(buildDeployArgs(flagsOf(['--no-build', '--artifact', '/tmp/nexus-hub']), { endpoint: 'https://e' }, 'fresh')).toEqual([
             '--endpoint', 'https://e',
             '--mode', 'local',
-            '--port', '8085',
             '--no-build',
             '--artifact', '/tmp/nexus-hub',
         ]);
     });
 
-    it('teardown carries ONLY endpoint/token/--teardown (mode/port/env would imply meaning)', () => {
-        const flags = flagsOf(['--teardown', '--endpoint', 'https://e', '--token', 't', '--port', '9000', '--env', 'A=1']);
-        expect(buildDeployArgs(flags, { endpoint: 'https://e', token: 't' }, 'teardown')).toEqual(['--endpoint', 'https://e', '--token', 't', '--teardown']);
+    it('teardown carries ONLY endpoint/credentials/--teardown (mode/port/env would imply meaning)', () => {
+        const flags = flagsOf(['--teardown', '--endpoint', 'https://e', '--token', 't', '--admin-token', 'a', '--port', '9000', '--env', 'A=1']);
+        expect(buildDeployArgs(flags, { endpoint: 'https://e', token: 't' }, 'teardown')).toEqual(['--endpoint', 'https://e', '--token', 't', '--admin-token', 'a', '--teardown']);
         expect(buildDeployArgs(flagsOf(['--teardown', '--endpoint', 'https://e']), { endpoint: 'https://e' }, 'teardown')).toEqual(['--endpoint', 'https://e', '--teardown']);
     });
 
@@ -399,14 +427,12 @@ describe('start-daytona: deploy argv per mode', () => {
         // the .ts sibling.
         expect(invocation).toEqual({
             command: process.execPath,
-            args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://e', '--mode', 'local', '--port', '8085'],
+            args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://e', '--mode', 'local'],
             cwd: PACKAGE_ROOT,
             env: ENV,
         });
         // Identity, not equality: the child must see the caller's env object UNTOUCHED.
         expect(invocation.env).toBe(ENV);
-        // args[0] is the vite-node CLI, args[1] the script it loads — spawn(command, args)
-        // runs exactly what the dry run prints.
         expect(invocation.args[0]).toBe(VITE_NODE_CLI);
         expect(invocation.args[1]).toBe(DEPLOY_SCRIPT_PATH);
         expect(invocation.command).not.toBe('node');
@@ -414,24 +440,24 @@ describe('start-daytona: deploy argv per mode', () => {
 });
 
 describe('start-daytona: plans', () => {
-    it('fresh plan shows the createSandbox options and a placeholder endpoint (it does not exist yet)', () => {
+    it('fresh plan shows the createSandbox options and a derived hub URL (no minting step)', () => {
         const plan = buildPlan(flagsOf(['--ttl', '30', '--private', '--api-key', 'dtn_key']), ENV);
         expect(plan.mode).toBe('fresh');
         expect(plan.sandboxOptions).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, public: false, cpu: 1, mem: 1, disk: 3 });
-        expect(plan.invocation.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', '<from createSandbox>', '--mode', 'local', '--port', '8085']);
+        expect(plan.invocation.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', '<from createSandbox>', '--mode', 'local']);
         expect(plan.invocation.cwd).toBe(PACKAGE_ROOT);
-        expect(plan.hub).toEqual({ port: 8085, via: 'sandbox.getPreviewLink(8085)' });
+        expect(plan.hub).toEqual({ path: '/app/nexus/', via: 'endpoint + /app/nexus/ (one runner origin; no per-port preview link)' });
     });
 
-    it('reuse plan prints the given endpoint and has no sandbox-options block', () => {
+    it('reuse plan prints the given endpoint and the same derived hub path', () => {
         const plan = buildPlan(flagsOf(['--endpoint', 'https://e', '--token', 't']), ENV);
         expect(plan.mode).toBe('reuse');
         expect(plan.sandboxOptions).toBeUndefined();
-        expect(plan.invocation.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://e', '--token', 't', '--mode', 'local', '--port', '8085']);
-        expect(plan.hub).toEqual({ port: 8085, via: 'sandbox.getPreviewLink(8085)' });
+        expect(plan.invocation.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://e', '--token', 't', '--mode', 'local']);
+        expect(plan.hub).toEqual({ path: '/app/nexus/', via: 'endpoint + /app/nexus/ (one runner origin; no per-port preview link)' });
     });
 
-    it('teardown plan mints no hub URL', () => {
+    it('teardown plan has no hub URL', () => {
         const plan = buildPlan(flagsOf(['--teardown', '--endpoint', 'https://e']), ENV);
         expect(plan.mode).toBe('teardown');
         expect(plan.sandboxOptions).toBeUndefined();
@@ -441,14 +467,14 @@ describe('start-daytona: plans', () => {
 });
 
 describe('start-daytona: the machine-readable line', () => {
-    it('is one single line carrying every fresh-mode field, in the documented order', () => {
-        const line = buildSummary({ mode: 'fresh', endpoint: 'https://e', token: 't', hubUrl: 'https://hub', hubToken: 'ht', sandboxId: 'sbx-1234', name: 'nexus-1', public: false, hubPort: 8085 });
+    it('is one single line, carries the derived hubUrl, and derives hubToken from token', () => {
+        const line = buildSummary({ mode: 'fresh', endpoint: 'https://e', token: 't', hubUrl: 'https://e/app/nexus/', sandboxId: 'sbx-1234', name: 'nexus-1', public: false, hubPort: 20042 });
         expect(line.includes('\n')).toBe(false);
-        expect(line).toBe('{"mode":"fresh","endpoint":"https://e","token":"t","hubUrl":"https://hub","hubToken":"ht","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":8085}');
+        expect(line).toBe('{"mode":"fresh","endpoint":"https://e","token":"t","hubUrl":"https://e/app/nexus/","hubToken":"t","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":20042}');
     });
 
-    it('omits empty tokens instead of sending ""', () => {
-        expect(buildSummary({ mode: 'fresh', endpoint: 'https://e', hubUrl: 'https://hub', hubToken: '', sandboxId: 'sbx-1234', hubPort: 9000 })).toBe('{"mode":"fresh","endpoint":"https://e","hubUrl":"https://hub","sandboxId":"sbx-1234","hubPort":9000}');
+    it('omits hubPort when the internal port was auto-allocated, and omits empty tokens', () => {
+        expect(buildSummary({ mode: 'reuse', endpoint: 'https://e', hubUrl: 'https://e/app/nexus/' })).toBe('{"mode":"reuse","endpoint":"https://e","hubUrl":"https://e/app/nexus/"}');
     });
 
     it('drops the token keys for a PUBLIC sandbox even though Daytona hands a token back', () => {
@@ -457,29 +483,27 @@ describe('start-daytona: the machine-readable line', () => {
         // real create (Temp/daytona-sandbox/last-sandbox.json: public:true + a token).
         // Presence is NOT the "send the header" signal, so a bare public hub must not
         // publish token fields an operator would then paste into a curl that needs none.
-        const line = buildSummary({ mode: 'fresh', endpoint: 'https://e', token: 'dtn_preview_token', hubUrl: 'https://hub', hubToken: 'hub_preview_token', sandboxId: 'sbx-1234', name: 'nexus-1', public: true, hubPort: 8085 });
-        expect(line).toBe('{"mode":"fresh","endpoint":"https://e","hubUrl":"https://hub","sandboxId":"sbx-1234","name":"nexus-1","public":true,"hubPort":8085}');
+        const line = buildSummary({ mode: 'fresh', endpoint: 'https://e', token: 'dtn_preview_token', hubUrl: 'https://e/app/nexus/', sandboxId: 'sbx-1234', name: 'nexus-1', public: true });
+        expect(line).toBe('{"mode":"fresh","endpoint":"https://e","hubUrl":"https://e/app/nexus/","sandboxId":"sbx-1234","name":"nexus-1","public":true}');
         expect(line).not.toContain('dtn_preview_token');
-        expect(line).not.toContain('hub_preview_token');
     });
 
     it('keeps the operator token when visibility is unknown (reuse mode has no handle)', () => {
-        // public is absent here, so the conservative reading wins: an extra valid header
-        // is harmless, a missing one on a private endpoint is a 401.
         expect(needsPreviewToken(undefined, 't')).toBe(true);
         expect(needsPreviewToken(false, 't')).toBe(true);
         expect(needsPreviewToken(true, 't')).toBe(false);
         expect(needsPreviewToken(true, undefined)).toBe(false);
         expect(needsPreviewToken(false, '')).toBe(false);
-    });
-
-    it('keeps hubUrl present but null in reuse mode (a consumer must not read it as a URL)', () => {
-        expect(buildSummary({ mode: 'reuse', endpoint: 'https://e', token: 't', hubUrl: null, hubPort: 8085 })).toBe('{"mode":"reuse","endpoint":"https://e","token":"t","hubUrl":null,"hubPort":8085}');
+        // The two human labels the flow prints, pinned: reuse cannot claim "public".
+        expect(previewLabel(undefined, 't')).toBe(' [x-daytona-preview-token required]');
+        expect(previewLabel(undefined, '')).toBe(' [no token]');
+        expect(previewLabel(false, 't')).toBe(' [x-daytona-preview-token required]');
+        expect(previewLabel(true, 't')).toBe(' [public, no token]');
     });
 });
 
 describe('start-daytona: fresh mode', () => {
-    it('creates once, spawns once with the CREATED endpoint, mints the hub URL, ends on the JSON line', async () => {
+    it('creates once, spawns once, DERIVES the hub URL (no getPreviewLink), ends on the JSON line', async () => {
         const handle = makeHandle();
         const { createSpy, spawnSpy, lines, problems, invocations, deps } = makeDeps(handle, 0);
         expect(await runStartDaytona(flagsOf(['--ttl', '30', '--private', '--api-key', 'dtn_key', '--env', 'NEXUS_TOKEN=xyz']), deps)).toBe(0);
@@ -491,22 +515,23 @@ describe('start-daytona: fresh mode', () => {
 
         // ONE child call: the created endpoint, the forwarded token, env untouched.
         expect(spawnSpy).toHaveBeenCalledTimes(1);
-        expect(invocations).toEqual([{ command: process.execPath, args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local', '--port', '8085', '--env', 'NEXUS_TOKEN=xyz'], cwd: PACKAGE_ROOT, env: ENV }]);
+        expect(invocations).toEqual([{ command: process.execPath, args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local', '--env', 'NEXUS_TOKEN=xyz'], cwd: PACKAGE_ROOT, env: ENV }]);
         expect(invocations[0]!.env).toBe(ENV);
 
-        // The hub URL is a per-port preview link, never a rewrite of the endpoint string.
-        expect(handle.sandbox.getPreviewLink).toHaveBeenCalledWith(8085);
+        // v2: the hub URL is endpoint + /app/nexus/, and NOTHING is minted per port.
+        expect(handle.sandbox.getPreviewLink).not.toHaveBeenCalled();
         expect(handle.sandbox.delete).not.toHaveBeenCalled();
 
         // Human lines carry BOTH URLs and the billing note; the LAST line is the contract.
         expect(lines).toEqual([
             '[nexus:start] creating a Daytona sandbox (minutes; --ttl unset = it bills until deleted)…',
             '[nexus:start] ✓ sandbox sbx-1234 (nexus-1) ready — management endpoint https://proxy.example/runner-7777',
-            '[nexus:start] ✓ nexus hub is live',
-            '[nexus:start]   hub URL (clients connect here) [x-daytona-preview-token required]: https://proxy.example/hub-8085',
-            '[nexus:start]   management endpoint (POST/status/logs) [x-daytona-preview-token]: https://proxy.example/runner-7777',
+            '[nexus:start] ✓ nexus app is live at /app/nexus/',
+            '[nexus:start]   hub URL (clients connect here) [x-daytona-preview-token required]: https://proxy.example/runner-7777/app/nexus/',
+            '[nexus:start]   management endpoint (control plane: /health /apps /apps/nexus/logs) [x-daytona-preview-token required]: https://proxy.example/runner-7777',
             '[nexus:start]   sandbox sbx-1234 — bills until sandbox.delete() or its 30-minute TTL fires',
-            '{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/hub-8085","hubToken":"hub_token","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":8085}',
+            '[nexus:start]   internal app port: auto-allocated by the runner (no --port given)',
+            '{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/runner-7777/app/nexus/","hubToken":"dtn_preview_token","sandboxId":"sbx-1234","name":"nexus-1","public":false}',
         ]);
     });
 
@@ -516,19 +541,102 @@ describe('start-daytona: fresh mode', () => {
         const handle = makeHandle({ public: true });
         const { deps, lines } = makeDeps(handle, 0);
         expect(await runStartDaytona(flagsOf([]), deps)).toBe(0);
-        expect(lines[3]).toBe('[nexus:start]   hub URL (clients connect here) [public, no token]: https://proxy.example/hub-8085');
-        expect(lines[4]).toBe('[nexus:start]   management endpoint (POST/status/logs) [no token]: https://proxy.example/runner-7777');
+        expect(lines[3]).toBe('[nexus:start]   hub URL (clients connect here) [public, no token]: https://proxy.example/runner-7777/app/nexus/');
+        expect(lines[4]).toBe('[nexus:start]   management endpoint (control plane: /health /apps /apps/nexus/logs) [public, no token]: https://proxy.example/runner-7777');
         expect(lines[5]).toBe('[nexus:start]   sandbox sbx-1234 — bills until sandbox.delete() (no --ttl fence was set)');
-        expect(lines[6]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","hubUrl":"https://proxy.example/hub-8085","sandboxId":"sbx-1234","name":"nexus-1","public":true,"hubPort":8085}');
+        expect(lines[7]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","hubUrl":"https://proxy.example/runner-7777/app/nexus/","sandboxId":"sbx-1234","name":"nexus-1","public":true}');
     });
 
-    it('--private is still authenticated — the token shows up in the labels and the line', async () => {
-        const handle = makeHandle({ public: false });
-        const { deps, lines } = makeDeps(handle, 0);
-        expect(await runStartDaytona(flagsOf(['--private']), deps)).toBe(0);
-        expect(lines[3]).toBe('[nexus:start]   hub URL (clients connect here) [x-daytona-preview-token required]: https://proxy.example/hub-8085');
-        expect(lines[4]).toBe('[nexus:start]   management endpoint (POST/status/logs) [x-daytona-preview-token]: https://proxy.example/runner-7777');
-        expect(lines[6]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/hub-8085","hubToken":"hub_token","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":8085}');
+    it('--port is forwarded as the APP port and reported, never as part of the URL', async () => {
+        const handle = makeHandle();
+        const { deps, lines, invocations } = makeDeps(handle, 0);
+        expect(await runStartDaytona(flagsOf(['--port', '20042']), deps)).toBe(0);
+        expect(invocations[0]!.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local', '--port', '20042']);
+        expect(lines[6]).toBe('[nexus:start]   internal app port: 20042 (explicit; still not public — clients use /app/nexus/)');
+        expect(lines[7]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/runner-7777/app/nexus/","hubToken":"dtn_preview_token","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":20042}');
+        expect(handle.sandbox.getPreviewLink).not.toHaveBeenCalled();
+    });
+
+    it('forwards --replace and the admin token to the child', async () => {
+        const handle = makeHandle();
+        const { deps, invocations } = makeDeps(handle, 0);
+        expect(await runStartDaytona(flagsOf(['--replace', '--admin-token', 'admin-token']), deps)).toBe(0);
+        expect(invocations[0]!.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--admin-token', 'admin-token', '--mode', 'local', '--replace']);
+    });
+
+    it('FRESH: applies --admin-token to the new runner AND the deploy child, never printing it', async () => {
+        const handle = makeHandle({ adminAuth: 'env' });
+        const { deps, createSpy, invocations, lines, problems } = makeDeps(handle, 0);
+        expect(await runStartDaytona(flagsOf(['--admin-token', 'admin-token-value']), deps)).toBe(0);
+        // Boot half: the shared bring-up receives the token (env form even without
+        // SANDBOX_ADMIN_TOKEN in this process env).
+        expect(createSpy.mock.calls[0]![0]).toMatchObject({ adminToken: 'admin-token-value' });
+        expect(createSpy.mock.calls[0]![0].adminTokenFile).toBeUndefined();
+        // Deploy half: the child sends the separate Authorization Bearer.
+        expect(invocations[0]!.args[invocations[0]!.args.indexOf('--admin-token') + 1]).toBe('admin-token-value');
+        // Presence-only line, and no human/JSON summary carries the value.
+        expect(lines.some((line) => line.includes('runner admin auth') && line.includes('env form'))).toBe(true);
+        const printed = [...lines, ...problems].join('\n');
+        expect(printed).not.toContain('admin-token-value');
+        expect(JSON.stringify(JSON.parse(lines[lines.length - 1]!))).not.toContain('admin-token-value');
+        expect(JSON.parse(lines[lines.length - 1]!)).not.toHaveProperty('adminToken');
+    });
+
+    it('FRESH: the file form boots the runner and reaches the child via ENV, never argv or a log', async () => {
+        const filePath = writeAdminTokenFile();
+        const handle = makeHandle({ adminAuth: 'file' });
+        const { deps, createSpy, invocations, lines } = makeDeps(handle, 0);
+        deps.env = { ...ENV, SANDBOX_ADMIN_TOKEN_FILE: filePath };
+        expect(await runStartDaytona(flagsOf([]), deps)).toBe(0);
+        // Only the PATH reaches createSandbox; the shared bring-up uploads it 0600.
+        expect(createSpy.mock.calls[0]![0]).toMatchObject({ adminTokenFile: filePath });
+        expect(createSpy.mock.calls[0]![0].adminToken).toBeUndefined();
+        // The child gets the same credential through its env, so argv stays clean.
+        expect(invocations[0]!.env).toEqual({ ...ENV, SANDBOX_ADMIN_TOKEN_FILE: filePath, NEXUS_SANDBOX_ADMIN_TOKEN: ADMIN_TOKEN });
+        expect(invocations[0]!.args).not.toContain(ADMIN_TOKEN);
+        const printed = lines.join('\n');
+        expect(printed).not.toContain(ADMIN_TOKEN);
+        expect(lines.some((line) => line.includes('runner admin auth') && line.includes('file form'))).toBe(true);
+    });
+
+    it('FRESH: the file form wins over --admin-token for the boot AND the Bearer', async () => {
+        const filePath = writeAdminTokenFile();
+        const handle = makeHandle({ adminAuth: 'file' });
+        const { deps, createSpy, invocations, lines } = makeDeps(handle, 0);
+        deps.env = { ...ENV, SANDBOX_ADMIN_TOKEN_FILE: filePath };
+        expect(await runStartDaytona(flagsOf(['--admin-token', 'flag-token-should-lose']), deps)).toBe(0);
+        // createSandbox gets both; the shared file-first rule makes the file win.
+        expect(createSpy.mock.calls[0]![0]).toMatchObject({ adminToken: 'flag-token-should-lose', adminTokenFile: filePath });
+        // The child must send the WINNING (file) token, not the losing flag.
+        expect(invocations[0]!.args).not.toContain('flag-token-should-lose');
+        expect(invocations[0]!.env.NEXUS_SANDBOX_ADMIN_TOKEN).toBe(ADMIN_TOKEN);
+        expect(lines.some((line) => line.includes('file form wins'))).toBe(true);
+        expect(lines.join('\n')).not.toContain('flag-token-should-lose');
+    });
+
+    it('REUSE: sends the Bearer but warns that the boot credential cannot be changed', async () => {
+        const { deps, invocations, lines } = makeDeps(undefined, 0);
+        expect(await runStartDaytona(flagsOf(['--endpoint', 'https://e.example', '--admin-token', 'admin-token-value']), deps)).toBe(0);
+        // Existing setup behaviour: the child still sends the separate Bearer.
+        expect(invocations[0]!.args[invocations[0]!.args.indexOf('--admin-token') + 1]).toBe('admin-token-value');
+        // …but the run says plainly that boot-time auth was NOT changed.
+        expect(lines.some((line) => line.includes('reuse cannot enable or change') && line.includes('SANDBOX_ADMIN_TOKEN'))).toBe(true);
+        const printed = lines.join('\n');
+        expect(printed).not.toContain('admin-token-value');
+        expect(lines[lines.length - 1]).not.toContain('admin-token-value');
+    });
+
+    it('DRY RUN: masks the admin token in the printed plan, and says reuse is Bearer-only', async () => {
+        const fresh = makeDeps(undefined, 0);
+        expect(await runStartDaytona(flagsOf(['--dry-run', '--admin-token', 'admin-token-value']), fresh.deps)).toBe(0);
+        expect(fresh.lines.join('\n')).toContain('"adminToken": "***"');
+        expect(fresh.lines.join('\n')).not.toContain('admin-token-value');
+        expect(fresh.createSpy).not.toHaveBeenCalled();
+
+        const reuse = makeDeps(undefined, 0);
+        expect(await runStartDaytona(flagsOf(['--dry-run', '--endpoint', 'https://e.example', '--admin-token', 'admin-token-value']), reuse.deps)).toBe(0);
+        expect(reuse.lines.join('\n')).toContain('reuse does not boot or reboot');
+        expect(reuse.lines.join('\n')).not.toContain('admin-token-value');
     });
 
     it('forwards createSandbox progress through the prefixed sink (a quiet library needs a loud host)', async () => {
@@ -580,45 +688,28 @@ describe('start-daytona: fresh mode', () => {
         ]);
     });
 
-    it('keeps the sandbox when only the hub URL fails to mint (the deploy itself succeeded)', async () => {
-        const handle = makeHandle();
-        handle.sandbox.getPreviewLink = vi.fn(async () => {
-            throw new Error('preview boom');
-        });
-        const { deps, lines, problems } = makeDeps(handle, 0);
-        expect(await runStartDaytona(flagsOf([]), deps)).toBe(1);
-        expect(handle.sandbox.delete).not.toHaveBeenCalled();
-        expect(problems).toEqual([
-            '[nexus:start] ✗ deploy is ready but the hub preview URL could not be minted: preview boom',
-            '[nexus:start]   sandbox sbx-1234 LEFT RUNNING (billing) — mint getPreviewLink(8085) yourself',
-            '[nexus:start]   management endpoint, still usable: https://proxy.example/runner-7777',
-        ]);
-        // No hub URL, so no machine-readable line to chain off.
-        expect(lines[lines.length - 1]).not.toMatch(/^\{/);
-    });
-
-    it('--no-wait forwards the flag and warns that the hub may still be booting', async () => {
+    it('--no-wait forwards the flag and warns that the app may still be booting', async () => {
         const handle = makeHandle();
         const { deps, lines, invocations } = makeDeps(handle, 0);
         expect(await runStartDaytona(flagsOf(['--no-wait']), deps)).toBe(0);
-        expect(invocations[0]!.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local', '--port', '8085', '--no-wait']);
-        expect(lines[6]).toBe('[nexus:start]   (--no-wait: the deploy was accepted, the hub may still be booting — probe the hub URL)');
-        expect(lines[7]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/hub-8085","hubToken":"hub_token","sandboxId":"sbx-1234","name":"nexus-1","public":false,"hubPort":8085}');
+        expect(invocations[0]!.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local', '--no-wait']);
+        expect(lines[7]).toBe('[nexus:start]   (--no-wait: the deploy was accepted, the app may still be booting — probe the hub URL)');
+        expect(lines[8]).toBe('{"mode":"fresh","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/runner-7777/app/nexus/","hubToken":"dtn_preview_token","sandboxId":"sbx-1234","name":"nexus-1","public":false}');
     });
 });
 
 describe('start-daytona: reuse mode (never touches sandbox lifecycle)', () => {
-    it('creates nothing, spawns against the given endpoint, and prints hubUrl null', async () => {
+    it('creates nothing, spawns against the given endpoint, and DERIVES the same hub URL', async () => {
         const { deps, createSpy, lines, invocations } = makeDeps(undefined, 0);
         expect(await runStartDaytona(flagsOf(['--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token']), deps)).toBe(0);
         expect(createSpy).not.toHaveBeenCalled();
-        expect(invocations).toEqual([{ command: process.execPath, args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local', '--port', '8085'], cwd: PACKAGE_ROOT, env: ENV }]);
+        expect(invocations).toEqual([{ command: process.execPath, args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--mode', 'local'], cwd: PACKAGE_ROOT, env: ENV }]);
         expect(lines).toEqual([
             '[nexus:start] deploying into the existing endpoint https://proxy.example/runner-7777 (not created here — no sandbox lifecycle actions)',
             '[nexus:start] ✓ deploy ready on https://proxy.example/runner-7777',
-            '[nexus:start]   hub URL (clients connect here): not minted — reuse mode holds no sandbox handle; run getPreviewLink(8085) on the owning sandbox',
-            '[nexus:start]   management endpoint (POST/status/logs): https://proxy.example/runner-7777',
-            '{"mode":"reuse","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":null,"hubPort":8085}',
+            '[nexus:start]   hub URL (clients connect here) [x-daytona-preview-token required]: https://proxy.example/runner-7777/app/nexus/',
+            '[nexus:start]   management endpoint (control plane: /health /apps /apps/nexus/logs) [x-daytona-preview-token required]: https://proxy.example/runner-7777',
+            '{"mode":"reuse","endpoint":"https://proxy.example/runner-7777","token":"dtn_preview_token","hubUrl":"https://proxy.example/runner-7777/app/nexus/","hubToken":"dtn_preview_token"}',
         ]);
     });
 
@@ -628,17 +719,18 @@ describe('start-daytona: reuse mode (never touches sandbox lifecycle)', () => {
         // A handle is lying around on purpose: reuse must still never reach for delete.
         expect(await runStartDaytona(flagsOf(['--endpoint', 'https://e.example', '--keep-on-fail']), deps)).toBe(4);
         expect(handle.sandbox.delete).not.toHaveBeenCalled();
+        expect(handle.sandbox.getPreviewLink).not.toHaveBeenCalled();
         expect(problems).toEqual(['[nexus:start] ✗ deploy failed (exit 4) — the deploy output above is the diagnosis; nothing was created, so nothing to clean up']);
     });
 });
 
 describe('start-daytona: teardown mode', () => {
-    it('spawns endpoint/token/--teardown only, mints nothing, deletes nothing', async () => {
+    it('spawns endpoint/credentials/--teardown only, derives nothing, deletes no sandbox', async () => {
         const { deps, createSpy, lines, problems, invocations } = makeDeps(undefined, 0);
-        expect(await runStartDaytona(flagsOf(['--teardown', '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token']), deps)).toBe(0);
+        expect(await runStartDaytona(flagsOf(['--teardown', '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--admin-token', 'admin-token']), deps)).toBe(0);
         expect(createSpy).not.toHaveBeenCalled();
-        expect(invocations).toEqual([{ command: process.execPath, args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--teardown'], cwd: PACKAGE_ROOT, env: ENV }]);
-        expect(lines).toEqual(['[nexus:start] tearing down the runtime slot at https://proxy.example/runner-7777 (DELETE / — the SANDBOX is not deleted)']);
+        expect(invocations).toEqual([{ command: process.execPath, args: [VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', 'https://proxy.example/runner-7777', '--token', 'dtn_preview_token', '--admin-token', 'admin-token', '--teardown'], cwd: PACKAGE_ROOT, env: ENV }]);
+        expect(lines).toEqual(['[nexus:start] tearing down app "nexus" at https://proxy.example/runner-7777 (DELETE /apps/nexus — the SANDBOX is not deleted)']);
         // No hub URL exists in this mode, so the JSON contract does not apply.
         expect(lines.filter((line) => line.startsWith('{'))).toEqual([]);
         expect(problems).toEqual([]);
@@ -668,11 +760,12 @@ describe('start-daytona: dry run touches nothing', () => {
                 '[nexus:start] DRY RUN — no sandbox is created, no script is spawned, no network call',
                 '[nexus:start] mode: fresh',
                 '[nexus:start] sandbox options that WOULD be used:',
-                '  {\n    "apiKey": "dtn_key",\n    "ttlMinutes": 30,\n    "public": false,\n    "cpu": 1,\n    "mem": 1,\n    "disk": 3\n  }',
+                // apiKey/adminToken are masked; everything else is the real option.
+                '  {\n    "apiKey": "***",\n    "ttlMinutes": 30,\n    "public": false,\n    "cpu": 1,\n    "mem": 1,\n    "disk": 3\n  }',
                 '[nexus:start] (unset knobs keep the @services/daytona defaults, except resources: the sandbox defaults to the measured 1 vCPU / 1 GiB RAM hub footprint on 3 GiB disk (the Daytona default — the runner, the staged bundle/artifacts and the Daytona session log all live there); --ttl unset means NO kill fence)',
                 `[nexus:start] deploy command that WOULD run (cwd ${PACKAGE_ROOT}):`,
-                `  ${process.execPath} ${VITE_NODE_CLI} ${DEPLOY_SCRIPT_PATH} --endpoint <from createSandbox> --mode local --port 8085`,
-                '[nexus:start] hub URL after success: sandbox.getPreviewLink(8085)',
+                `  ${process.execPath} ${VITE_NODE_CLI} ${DEPLOY_SCRIPT_PATH} --endpoint <from createSandbox> --mode local`,
+                '[nexus:start] hub URL after success: endpoint + /app/nexus/ (one runner origin; no per-port preview link)',
             ]);
         } finally {
             vi.unstubAllGlobals();
@@ -687,8 +780,8 @@ describe('start-daytona: dry run touches nothing', () => {
             '[nexus:start] DRY RUN — no sandbox is created, no script is spawned, no network call',
             '[nexus:start] mode: reuse',
             `[nexus:start] deploy command that WOULD run (cwd ${PACKAGE_ROOT}):`,
-            `  ${process.execPath} ${VITE_NODE_CLI} ${DEPLOY_SCRIPT_PATH} --endpoint https://proxy.example/runner-7777 --token t --mode local --port 8085`,
-            '[nexus:start] hub URL after success: sandbox.getPreviewLink(8085)',
+            `  ${process.execPath} ${VITE_NODE_CLI} ${DEPLOY_SCRIPT_PATH} --endpoint https://proxy.example/runner-7777 --token *** --mode local`,
+            '[nexus:start] hub URL after success: endpoint + /app/nexus/ (one runner origin; no per-port preview link)',
         ]);
         expect(reuse.createSpy).not.toHaveBeenCalled();
 
@@ -715,7 +808,12 @@ describe('start-daytona: main() maps results onto exit codes', () => {
         expect(USAGE).toContain('BILLING');
         // D1: the header name operators are told to send must be the real one.
         expect(USAGE).toContain('x-daytona-preview-token');
+        expect(USAGE).toContain('--admin-token');
         expect(USAGE).not.toContain('x-preview-token required');
+        // v2: the app path replaces the per-port preview story.
+        expect(USAGE).toContain('AUTO-ALLOCATES');
+        expect(USAGE).toContain('/app/nexus/');
+        expect(USAGE).not.toContain('getPreviewLink');
         // R1: the interrupt contract is operator-facing, so it lives in --help.
         expect(USAGE).toContain('exits 130 for SIGINT, 143 for');
         expect(USAGE).toContain('Reuse, teardown and dry-run install no handlers');
@@ -734,8 +832,8 @@ describe('start-daytona: main() maps results onto exit codes', () => {
 
     it('a bad command line prints every error plus the usage and exits 1', async () => {
         const { deps, problems } = makeDeps(undefined, 0);
-        expect(await main(['--wat', '--port', '0'], deps)).toBe(1);
-        expect(problems.slice(0, 3)).toEqual(['[nexus:start] ✗ unknown flag "--wat"', '[nexus:start] ✗ --port "0" is out of range (TCP port 1-65535)', '']);
+        expect(await main(['--wat', '--port', '-1'], deps)).toBe(1);
+        expect(problems.slice(0, 3)).toEqual(['[nexus:start] ✗ unknown flag "--wat"', '[nexus:start] ✗ --port "-1" is out of range (TCP port 0-65535 (0 = auto))', '']);
         expect(problems[3]).toBe(USAGE);
     });
 
@@ -848,13 +946,7 @@ describe('start-daytona: interrupt policy (decideInterruptCleanup, pure)', () =>
     const created = { sandboxId: 'sbx-1234' };
     it('a fresh run holding a sandbox owes a delete, at 130 for SIGINT', () => {
         expect(decideInterruptCleanup({ mode: 'fresh', created, phase: 'deploying' as InterruptPhase, signal: 'SIGINT' })).toEqual({ shouldDelete: true, exitCode: 130 });
-        // Minting the hub URL is still inside the window: the hub is paid for, unserved.
-        expect(decideInterruptCleanup({ mode: 'fresh', created, phase: 'minting' as InterruptPhase, signal: 'SIGTERM' })).toEqual({ shouldDelete: true, exitCode: 143 });
-    });
-
-    it('SIGINT is 130 and SIGTERM is 143 in every branch', () => {
-        expect(decideInterruptCleanup({ mode: 'fresh', created, phase: 'creating' as InterruptPhase, signal: 'SIGINT' })).toEqual({ shouldDelete: false, exitCode: 130 });
-        expect(decideInterruptCleanup({ mode: 'reuse', created, phase: 'deploying' as InterruptPhase, signal: 'SIGTERM' })).toEqual({ shouldDelete: false, exitCode: 143 });
+        expect(decideInterruptCleanup({ mode: 'fresh', created, phase: 'deploying' as InterruptPhase, signal: 'SIGTERM' })).toEqual({ shouldDelete: true, exitCode: 143 });
     });
 
     it('owes nothing while createSandbox has not returned (its own failure path deletes)', () => {
@@ -864,19 +956,18 @@ describe('start-daytona: interrupt policy (decideInterruptCleanup, pure)', () =>
     it('owes nothing without a handle, and never in reuse/teardown (not our sandbox)', () => {
         expect(decideInterruptCleanup({ mode: 'fresh', phase: 'deploying' as InterruptPhase, signal: 'SIGINT' })).toEqual({ shouldDelete: false, exitCode: 130 });
         expect(decideInterruptCleanup({ mode: 'reuse', created, phase: 'deploying' as InterruptPhase, signal: 'SIGINT' })).toEqual({ shouldDelete: false, exitCode: 130 });
-        expect(decideInterruptCleanup({ mode: 'teardown', created, phase: 'minting' as InterruptPhase, signal: 'SIGTERM' })).toEqual({ shouldDelete: false, exitCode: 143 });
+        expect(decideInterruptCleanup({ mode: 'teardown', created, phase: 'deploying' as InterruptPhase, signal: 'SIGTERM' })).toEqual({ shouldDelete: false, exitCode: 143 });
     });
 });
 
 describe('start-daytona: the fresh-mode interrupt fence (Ctrl-C must not leave a billing sandbox)', () => {
     it('SIGINT during the deploy deletes the sandbox, prints the outcome, and exits 130', async () => {
         const handle = makeHandle();
-        const { deps, lines, problems, trapped } = makeInterruptDeps(handle, { fireDuring: 'deploy', signal: 'SIGINT' });
+        const { deps, lines, problems, trapped } = makeInterruptDeps(handle, { signal: 'SIGINT' });
         expect(await runStartDaytona(flagsOf([]), deps)).toBe(130);
         // The delete is the whole point of the fence.
         expect(handle.sandbox.delete).toHaveBeenCalledTimes(1);
-        // The deploy succeeded, but the run was interrupted before the mint, so no
-        // hub URL, no JSON line, and no second delete from the failure path.
+        // No per-port preview call ever happened, even on the interrupted path.
         expect(handle.sandbox.getPreviewLink).not.toHaveBeenCalled();
         expect(problems).toEqual([]);
         expect(lines).toEqual([
@@ -889,14 +980,11 @@ describe('start-daytona: the fresh-mode interrupt fence (Ctrl-C must not leave a
         expect(trapped.size).toBe(0);
     });
 
-    it('SIGTERM during the hub-URL mint deletes it too and exits 143', async () => {
+    it('SIGTERM during the deploy deletes it too and exits 143', async () => {
         const handle = makeHandle();
-        const { deps, lines, problems, trapped } = makeInterruptDeps(handle, { fireDuring: 'mint', signal: 'SIGTERM' });
+        const { deps, lines, problems, trapped } = makeInterruptDeps(handle, { signal: 'SIGTERM' });
         expect(await runStartDaytona(flagsOf([]), deps)).toBe(143);
         expect(handle.sandbox.delete).toHaveBeenCalledTimes(1);
-        // The mint itself finished, but an interrupted run prints NO success block and
-        // no JSON contract: the sandbox is on its way out, so a consumer chaining off
-        // hubUrl would dial a dead box.
         expect(problems).toEqual([]);
         expect(lines).toEqual([
             '[nexus:start] creating a Daytona sandbox (minutes; --ttl unset = it bills until deleted)…',
@@ -911,7 +999,6 @@ describe('start-daytona: the fresh-mode interrupt fence (Ctrl-C must not leave a
         const handle = makeHandle();
         const timeouts: number[] = [];
         const { deps, lines, problems } = makeInterruptDeps(handle, {
-            fireDuring: 'deploy',
             signal: 'SIGINT',
             // A delete that never settles: only the bounded wait can end this run.
             deleteImpl: () => new Promise<never>(() => undefined),
@@ -932,7 +1019,6 @@ describe('start-daytona: the fresh-mode interrupt fence (Ctrl-C must not leave a
     it('a delete that throws is reported the same way instead of escaping the handler', async () => {
         const handle = makeHandle();
         const { deps, problems } = makeInterruptDeps(handle, {
-            fireDuring: 'deploy',
             signal: 'SIGINT',
             deleteImpl: async () => {
                 throw new Error('sdk offline');
@@ -944,7 +1030,7 @@ describe('start-daytona: the fresh-mode interrupt fence (Ctrl-C must not leave a
 
     it('reuse, teardown and dry-run arm no signal handlers at all', async () => {
         // Reuse/teardown: that endpoint was never ours, so trapping Ctrl-C there would
-        // delete someone else\'s sandbox.
+        // delete someone else's sandbox.
         const reuse = makeInterruptDeps(makeHandle());
         expect(await runStartDaytona(flagsOf(['--endpoint', 'https://proxy.example/runner-7777', '--token', 't']), reuse.deps)).toBe(0);
         expect(reuse.trapped.size).toBe(0);
@@ -960,7 +1046,7 @@ describe('start-daytona: the fresh-mode interrupt fence (Ctrl-C must not leave a
 
     it('fresh mode arms exactly SIGINT and SIGTERM, and un-arms them when the run ends', async () => {
         const handle = makeHandle();
-        const { deps, trapped } = makeInterruptDeps(handle);
+        const { deps, trapped } = makeInterruptDeps(handle, { fire: false });
         const seen: StartSignal[] = [];
         const original = deps.onSignal!;
         deps.onSignal = (signal, listener) => {

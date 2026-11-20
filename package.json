@@ -22,7 +22,7 @@
     "build": "cargo build --release -p nexus-server",
     "start": "cargo run -p nexus-server --bin nexus-hub",
     "deploy:daytona": "vite-node scripts/deploy-daytona.ts",
-    "#deploy:endpoint": "The platform-neutral verb: ONE URL argument (Daytona preview link, Modal box/sandbox URL, loopback runner), and it resolves a busy slot itself — preflight /health + /status, DELETE / if occupied, then deploy. On a Modal box the slot decides: empty = deploy as-is; busy = REPLACE the container (DELETE /sandbox, wait for the new empty one, deploy into it). scripts/deploy-endpoint.ts.",
+    "#deploy:endpoint": "The platform-neutral verb: ONE URL argument (Daytona runner preview URL, Modal box/sandbox URL, loopback runner). It gates on GET /health (sandbox runtime v2: apiVersion >= 2 or capabilities [apps]) and reads the named app at GET /apps/nexus: absent = POST /apps; ready|failed = PUT /apps/nexus (blue-green, peers untouched); queued|building|booting|draining = DELETE /apps/nexus then POST; --teardown = DELETE /apps/nexus and verifies the record is 404. It never uses the v1 /status alias or a root slot. The Modal container recycle (DELETE /_provider/sandbox, which discards EVERY app on the box) is opt-in only via --recycle-container and is refused for non-Modal endpoints and Modal sandbox tunnels. scripts/deploy-endpoint.ts.",
     "deploy:endpoint": "vite-node scripts/deploy-endpoint.ts",
     "worker": "cargo run -p nexus-worker-example",
     "bench": "cargo build --profile profiling -p nexus-server",
@@ -32,7 +32,7 @@
     "#ts": "The TypeScript surface is scripts/*.ts ONLY (the Rust crates are checked by cargo, and every host script runs on the root-hoisted vite-node — no build step, no raw node). test:scripts covers the scripts; `test` stays cargo, which turbo orchestrates.",
     "typecheck": "tsc --noEmit",
     "test:scripts": "vitest run scripts",
-    "#test:scripts": "Covers the tsx lifecycle scripts by glob (scripts/*.test.ts): start-daytona's parser/plan/argv/modes/interrupt guard, deploy-daytona's parser, auth matrix, tar packing, plan, retry policy and poll state machine, and deploy-endpoint's cold-start/auth/dead probe table, slot policy, child argv and hub-URL reporting. Every side effect is injected — no network, no cargo, no sandbox — and counts are deliberately not restated here (drift).",
+    "#test:scripts": "Covers the tsx lifecycle scripts by glob (scripts/*.test.ts): start-daytona's parser/plan/argv/modes/admin-credential handoff/interrupt guard, deploy-daytona's parser, auth matrix, tar packing, v2 request shape, plan, retry policy and poll state machine, and deploy-endpoint's cold-start/auth/dead probe table, v2 health gate, app-scoped replace policy, explicit Modal recycle, child argv and hub-URL reporting. Every side effect is injected — no network, no cargo, no sandbox — and counts are deliberately not restated here (drift).",
     "verify": "yarn fmt:check && yarn clippy && yarn test && yarn build"
   },
   "#dependencies": "scripts/start-daytona.ts imports createSandbox from @services/daytona/sandbox, and scripts/start-modal.ts reads the Modal box URL from @config/vault; house convention is \"*\" + TS sources resolved through the workspace symlink (no build step, no lockfile entry needed for a private workspace package).",
