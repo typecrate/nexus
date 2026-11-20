@@ -356,9 +356,9 @@ describe('start-daytona: mode resolution', () => {
 });
 
 describe('start-daytona: sandbox option mapping', () => {
-    it('maps only the knobs that were given, and never passes --port as the RUNNER port', () => {
+    it('maps the knobs that were given plus the fixed idle window, and never passes --port as the RUNNER port', () => {
         const options = buildSandboxOptions(flagsOf(['--api-key', 'dtn_key', '--ttl', '30', '--private', '--snapshot', 'snap', '--cpu', '2', '--mem', '4', '--disk', '20', '--port', '9000']), {});
-        expect(options).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, public: false, snapshot: 'snap', cpu: 2, mem: 4, disk: 20 });
+        expect(options).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, idleMinutes: 30, public: false, snapshot: 'snap', cpu: 2, mem: 4, disk: 20 });
         // createSandbox's `port` is the RUNNER port (7777 = the management endpoint) while
         // --port is the APP's internal port; forwarding it would repoint the deploy.
         expect('port' in options).toBe(false);
@@ -366,7 +366,7 @@ describe('start-daytona: sandbox option mapping', () => {
 
     it('defaults the sandbox to the measured minimal footprint: 1 vCPU / 1 GiB RAM / 3 GiB disk', () => {
         const options = buildSandboxOptions(flagsOf([]), {});
-        expect(options).toEqual({ public: true, cpu: 1, mem: 1, disk: 3 }); // hub 7.7 MB RSS / ~0.25 ms per request; 3 GiB = Daytona's own disk default
+        expect(options).toEqual({ idleMinutes: 30, public: true, cpu: 1, mem: 1, disk: 3 }); // hub 7.7 MB RSS / ~0.25 ms per request; 3 GiB = Daytona's own disk default; 30 min = the idle reaper
         expect(options.apiKey).toBeUndefined(); // '' → absent, so DAYTONA_API_KEY/vault still apply
         expect(options.ttlMinutes).toBeUndefined(); // unset = NO wall-clock kill fence
         expect(options.snapshot).toBeUndefined(); // the service's own default snapshot
@@ -374,14 +374,14 @@ describe('start-daytona: sandbox option mapping', () => {
 
     it('maps the §12.3 admin credential into the fresh boot options, file form first', () => {
         // Explicit flag → env form handed to createSandbox (SANDBOX_ADMIN_TOKEN).
-        expect(buildSandboxOptions(flagsOf(['--admin-token', 'admin-token-value']), {})).toEqual({ public: true, cpu: 1, mem: 1, disk: 3, adminToken: 'admin-token-value' });
+        expect(buildSandboxOptions(flagsOf(['--admin-token', 'admin-token-value']), {})).toEqual({ idleMinutes: 30, public: true, cpu: 1, mem: 1, disk: 3, adminToken: 'admin-token-value' });
         // The shared alias and the generic name are both read when no flag is typed.
         expect(buildSandboxOptions(flagsOf([]), { NEXUS_SANDBOX_ADMIN_TOKEN: 'nexus-env-token-0123456789' })).toMatchObject({ adminToken: 'nexus-env-token-0123456789' });
         expect(buildSandboxOptions(flagsOf([]), { SANDBOX_ADMIN_TOKEN: 'env-token-0123456789' })).toMatchObject({ adminToken: 'env-token-0123456789' });
         // The preferred file form: only the PATH is passed; the value is read by the
         // shared bring-up (uploaded 0600) and by resolveAdminBearer for the Bearer.
         const filePath = writeAdminTokenFile();
-        expect(buildSandboxOptions(flagsOf([]), { SANDBOX_ADMIN_TOKEN_FILE: filePath })).toEqual({ public: true, cpu: 1, mem: 1, disk: 3, adminTokenFile: filePath });
+        expect(buildSandboxOptions(flagsOf([]), { SANDBOX_ADMIN_TOKEN_FILE: filePath })).toEqual({ idleMinutes: 30, public: true, cpu: 1, mem: 1, disk: 3, adminTokenFile: filePath });
     });
 });
 
@@ -443,7 +443,7 @@ describe('start-daytona: plans', () => {
     it('fresh plan shows the createSandbox options and a derived hub URL (no minting step)', () => {
         const plan = buildPlan(flagsOf(['--ttl', '30', '--private', '--api-key', 'dtn_key']), ENV);
         expect(plan.mode).toBe('fresh');
-        expect(plan.sandboxOptions).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, public: false, cpu: 1, mem: 1, disk: 3 });
+        expect(plan.sandboxOptions).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, idleMinutes: 30, public: false, cpu: 1, mem: 1, disk: 3 });
         expect(plan.invocation.args).toEqual([VITE_NODE_CLI, DEPLOY_SCRIPT_PATH, '--endpoint', '<from createSandbox>', '--mode', 'local']);
         expect(plan.invocation.cwd).toBe(PACKAGE_ROOT);
         expect(plan.hub).toEqual({ path: '/app/nexus/', via: 'endpoint + /app/nexus/ (one runner origin; no per-port preview link)' });
@@ -511,7 +511,7 @@ describe('start-daytona: fresh mode', () => {
 
         // ONE create, with the mapped options plus the progress sink.
         expect(createSpy).toHaveBeenCalledTimes(1);
-        expect(createSpy.mock.calls[0]![0]).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, public: false, snapshot: undefined, cpu: 1, mem: 1, disk: 3, log: expect.any(Function) });
+        expect(createSpy.mock.calls[0]![0]).toEqual({ apiKey: 'dtn_key', ttlMinutes: 30, idleMinutes: 30, public: false, snapshot: undefined, cpu: 1, mem: 1, disk: 3, log: expect.any(Function) });
 
         // ONE child call: the created endpoint, the forwarded token, env untouched.
         expect(spawnSpy).toHaveBeenCalledTimes(1);
@@ -761,8 +761,8 @@ describe('start-daytona: dry run touches nothing', () => {
                 '[nexus:start] mode: fresh',
                 '[nexus:start] sandbox options that WOULD be used:',
                 // apiKey/adminToken are masked; everything else is the real option.
-                '  {\n    "apiKey": "***",\n    "ttlMinutes": 30,\n    "public": false,\n    "cpu": 1,\n    "mem": 1,\n    "disk": 3\n  }',
-                '[nexus:start] (unset knobs keep the @services/daytona defaults, except resources: the sandbox defaults to the measured 1 vCPU / 1 GiB RAM hub footprint on 3 GiB disk (the Daytona default — the runner, the staged bundle/artifacts and the Daytona session log all live there); --ttl unset means NO kill fence)',
+                '  {\n    "apiKey": "***",\n    "ttlMinutes": 30,\n    "idleMinutes": 30,\n    "public": false,\n    "cpu": 1,\n    "mem": 1,\n    "disk": 3\n  }',
+                '[nexus:start] (unset knobs keep the @services/daytona defaults, except resources and idle: the sandbox defaults to the measured 1 vCPU / 1 GiB RAM hub footprint on 3 GiB disk (the Daytona default — the runner, the staged bundle/artifacts and the Daytona session log all live there), and 30 idle minutes stop+delete it; --ttl unset means NO wall-clock kill fence)',
                 `[nexus:start] deploy command that WOULD run (cwd ${PACKAGE_ROOT}):`,
                 `  ${process.execPath} ${VITE_NODE_CLI} ${DEPLOY_SCRIPT_PATH} --endpoint <from createSandbox> --mode local`,
                 '[nexus:start] hub URL after success: endpoint + /app/nexus/ (one runner origin; no per-port preview link)',

@@ -51,6 +51,10 @@
 //      setup-sandbox.ts:1411-1415) and KEEPS BILLING until it is deleted or its
 //      TTL fires. Nothing here deletes a sandbox on SUCCESS — that is the point
 //      (the hub you just paid for is meant to keep serving).
+//    · Every sandbox gets an explicit 30-minute IDLE window (SANDBOX_IDLE_MINUTES →
+//      createSandbox idleMinutes → Daytona autoStopInterval, delete on stop): 30
+//      minutes with no external activity stops AND deletes it, while an actively
+//      used hub never expires. This is independent of `--ttl`.
 //    · `--ttl <minutes>` is the only wall-clock fence; it defaults to UNSET, i.e.
 //      "runs forever" (createSandbox's own docs, setup-sandbox.ts:1557-1563).
 //    · `public: true` is the default (tokenless preview URLs). `--private` makes
@@ -227,7 +231,8 @@ export const USAGE = `usage: yarn workspace @typecrate/nexus start:daytona [flag
 
   sandbox creation (fresh mode only — illegal together with --endpoint):
     --api-key <key>   Daytona API key (else DAYTONA_API_KEY, else @config/vault)
-    --ttl <minutes>   server-side kill fence; DEFAULT = unset = bills until delete
+    --ttl <minutes>   server-side kill fence; DEFAULT = unset = no wall-clock fence
+                      (the fixed 30-minute idle reaper still applies)
     --public          tokenless preview URLs (default)
     --private         token-authenticated preview URLs (last of --public/--private wins)
     --snapshot <n>    base snapshot to boot from (default: the service's own)
@@ -283,8 +288,9 @@ export const USAGE = `usage: yarn workspace @typecrate/nexus start:daytona [flag
     never ours to delete.
 
   billing: a fresh sandbox is created per call and never deleted on success; only
-  --ttl or an explicit delete stops the meter. On deploy failure the sandbox IS
-  deleted unless --keep-on-fail. Reuse/teardown never touch a sandbox's lifecycle.`;
+  the 30-minute idle reaper, --ttl or an explicit delete stops the meter. On deploy
+  failure the sandbox IS deleted unless --keep-on-fail. Reuse/teardown never touch a
+  sandbox's lifecycle.`;
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  FLAGS — pure parser: it returns errors instead of printing or exiting
@@ -549,9 +555,18 @@ export const resolveAdminBearer = (flags: Pick<StartDaytonaFlags, 'adminToken'>,
 };
 
 /**
+ * Idle window for a sandbox this orchestrator creates, in minutes. createSandbox
+ * maps it to Daytona's `autoStopInterval` with `autoDeleteInterval: 0` (stop →
+ * delete), so half an hour without external activity reaps an abandoned hub
+ * instead of leaving it to the service's 120-minute default.
+ */
+export const SANDBOX_IDLE_MINUTES = 30;
+
+/**
  * Maps orchestrator flags onto createSandbox's option shape (sandbox/index.ts:8-12).
- * Only PRESENT knobs are set, so every default stays the service's own — and
- * `port` is deliberately NEVER set: createSandbox's `port` is the RUNNER's port
+ * The idle window is always explicit (SANDBOX_IDLE_MINUTES); every other knob is set
+ * only when given, so its default stays the service's own — and `port` is
+ * deliberately NEVER set: createSandbox's `port` is the RUNNER's port
  * (7777, the management endpoint), while our `--port` is the HUB's port. Passing it
  * through would repoint the management endpoint at the hub and break the deploy.
  */
@@ -566,6 +581,9 @@ export const buildSandboxOptions = (flags: StartDaytonaFlags, env: Readonly<Reco
         // '' means "not given" (the parser's absent marker) → env/vault fallback.
         apiKey: flags.apiKey || undefined,
         ttlMinutes: flags.ttl,
+        // Explicit even though --ttl is optional: an idle sandbox must not sit on the
+        // service's 2-hour default. 0 would disable the reaper, so this is always > 0.
+        idleMinutes: SANDBOX_IDLE_MINUTES,
         public: flags.public,
         snapshot: flags.snapshot,
         ...(adminToken ? { adminToken } : {}),
@@ -995,7 +1013,7 @@ export const runStartDaytona = async (flags: StartDaytonaFlags, deps: StartDayto
             // config; redactSandboxOptions masks the API key and the admin token so a
             // pasted plan never leaks either credential.
             log(`  ${JSON.stringify(redactSandboxOptions(plan.sandboxOptions), null, 2).split('\n').join('\n  ')}`);
-            log(`${PREFIX} (unset knobs keep the @services/daytona defaults, except resources: the sandbox defaults to the measured 1 vCPU / 1 GiB RAM hub footprint on 3 GiB disk (the Daytona default — the runner, the staged bundle/artifacts and the Daytona session log all live there); --ttl unset means NO kill fence)`);
+            log(`${PREFIX} (unset knobs keep the @services/daytona defaults, except resources and idle: the sandbox defaults to the measured 1 vCPU / 1 GiB RAM hub footprint on 3 GiB disk (the Daytona default — the runner, the staged bundle/artifacts and the Daytona session log all live there), and ${SANDBOX_IDLE_MINUTES} idle minutes stop+delete it; --ttl unset means NO wall-clock kill fence)`);
         }
         log(`${PREFIX} deploy command that WOULD run (cwd ${plan.invocation.cwd}):`);
         // Mask the value of every --token/--admin-token pair: a dry run must be
